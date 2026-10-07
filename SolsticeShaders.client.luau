@@ -131,6 +131,9 @@ do
 		-- behind (see Baseline.recover).
 	end
 end
+-- This copy is the one that runs: claim the heartbeat so later copies (from a
+-- respawn, or a second paste) see it and bow out.
+localPlayer:SetAttribute(RUNNING_ATTRIBUTE, os.clock())
 local heartbeatConnection = RunService.RenderStepped:Connect(function()
 	local beat = localPlayer:GetAttribute(RUNNING_ATTRIBUTE)
 	if type(beat) == "number" then
@@ -1978,7 +1981,9 @@ do
 		"ExposureCompensation",
 		"ShadowSoftness",
 		"GeographicLatitude",
-		"ClockTime",
+		-- ClockTime is not here: it is recorded only while the simulation owns
+		-- the clock (see Stage.clock), so a game's own day cycle is never
+		-- rewound to the hour Solstice happened to start at.
 	}
 
 	-- Record `value` as the original `property` of a place instance, on the
@@ -2019,24 +2024,30 @@ do
 		return value
 	end
 
+	-- Drop one recorded original, once its property is back in the place's hands.
+	function Baseline.unmark(instance, property)
+		instance:SetAttribute(MARK_PREFIX .. property, nil)
+	end
+
 	local function clearMarks(instance, apply)
 		for name, value in instance:GetAttributes() do
 			if string.sub(name, 1, #MARK_PREFIX) == MARK_PREFIX then
 				if apply then
 					local property = string.sub(name, #MARK_PREFIX + 1)
-				if string.sub(property, 1, 9) == "Material_" and instance:IsA("Terrain") then
-					local ok, material = pcall(function()
-						return (Enum.Material :: any)[string.sub(property, 10)]
-					end)
-					if ok and material then
-						pcall(instance.SetMaterialColor, instance, material, decodeMark(value))
+					if string.sub(property, 1, 9) == "Material_" and instance:IsA("Terrain") then
+						local ok, material = pcall(function()
+							return (Enum.Material :: any)[string.sub(property, 10)]
+						end)
+						if ok and material then
+							pcall(instance.SetMaterialColor, instance, material, decodeMark(value))
+						end
+					else
+						writeProperty(instance, property, decodeMark(value))
 					end
-				else
-					writeProperty(instance, property, decodeMark(value))
 				end
-			end
-		end
+				-- Only our own marks go: the place's attributes are not ours.
 				instance:SetAttribute(name, nil)
+			end
 		end
 		CollectionService:RemoveTag(instance, TOUCHED_TAG)
 	end
@@ -2430,6 +2441,10 @@ local Stage = {}
 -- Clock: who owns Lighting.ClockTime this frame.
 function Stage.clock(dt)
 	local mode = get("atmo.clock")
+	if not sim.clockOwned and (get("fun.timelapse") or mode == 2 or mode == 3) then
+		-- Taking the clock over: remember the place's hour to hand it back.
+		Baseline.lighting.ClockTime = Baseline.mark(Lighting, "ClockTime", Lighting.ClockTime)
+	end
 	if get("fun.timelapse") then
 		sim.clock = (sim.clock + dt * 24 / 40) % 24
 		sim.clockOwned = true
@@ -2450,6 +2465,8 @@ function Stage.clock(dt)
 		if sim.clockOwned then
 			sim.clockOwned = false
 			Baseline.releaseLighting({ "ClockTime" })
+			Baseline.lighting.ClockTime = nil
+			Baseline.unmark(Lighting, "ClockTime")
 		end
 		sim.clock = Lighting.ClockTime
 	end
@@ -2864,8 +2881,9 @@ function Stage.terrain(dt)
 				if not ok then
 					continue
 				end
-				original = color
-				Baseline.mark(terrain, "Material_" .. entry[1], original)
+				-- An earlier copy's mark holds the true original, if there is one.
+				original = Baseline.mark(terrain, "Material_" .. entry[1], color)
+				Baseline.terrainColors[material] = original
 			end
 			local color = seasonal or original
 			if coverStep > 0 then
@@ -7592,7 +7610,6 @@ end
 Overlay.probe()
 Settings.load() -- settings from before a respawn or restart, if any
 UI.build()
-	
 
 -- The power icon (and the fault guard) switch the whole engine on and off.
 Settings.onChange(function(id)
