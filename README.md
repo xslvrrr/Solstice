@@ -7,18 +7,20 @@ shader. It drives everything the engine does expose (Lighting, Atmosphere,
 Clouds, Sky, post-processing, Terrain water, local lights, part reflectance,
 particles, beams, sound effects and a screen overlay) from one simulation. That
 gets close to the look of Complementary Unbound with Euphoria Patches. It also
-includes an in-game settings panel, performance tiers and an adaptive quality
-governor.
+includes an in-game settings panel, saved and shareable configs, themes,
+performance tiers and an adaptive quality governor.
 
 ## Features
 
 | Tab | What it covers |
 | --- | --- |
-| **Atmosphere** | Dynamic time-of-day lighting with sun strength and night brightness, time-of-day colour, realistic (Future) lighting on request, dynamic or fixed clock, a custom atmosphere (fog, haze, sun glare, fog tint, morning mist, cave fog), light shafts, custom clouds (cover, thickness, tint, cloud shadows), custom stars, the Milky Way, shooting stars and meteor showers in any colour, and a full-sky aurora with five palettes or your own gradient |
-| **World** | Clear, rain, storm and snow weather, wind, lightning with visible forked bolts, rainbows after rain or always, rain that keeps falling outside while you shelter, wet glossy surfaces, puddles (size, shine) with raindrop ripples, ground splashes, snow cover on terrain, fireflies and dust motes, indoor dust caught by the light, seasonal grass tints, a custom sun path and shadow softness |
-| **Materials** | Custom sky reflections and ambient, a sheen for every material that goes all the way to a mirror, **real reflections** of the world and players in puddles, floors, mirrors and glass, chrome avatars that mirror the players and buildings around them, shadows from local lights (Future), light intensity, flicker and warmth, light halos and contact shadows for Voxel and ShadowMap, terrain water styles or a custom water colour, and an underwater shader (fog, lens warp, bubbles, muffled audio) |
-| **Camera** | Bloom, lens flare, motion blur, replacing the game's own effects, depth of field with adaptive autofocus, auto exposure, tone mapping, Lightroom-style grading (exposure, contrast, highlights, shadows, whites, blacks, clarity, dehaze, vibrance, saturation, white balance, three colour-picker wheels) with 16 presets, a Lightroom-style HSL colour mixer with hue rings, vignette, film grain, lens droplets and a speed FOV kick |
-| **Fun** | Filters (Noir, Sepia, Dream, Vapor, Night vision, Frostbite, Inferno), hue cycle, tilt-shift, cinematic bars, camera wobble, crosshairs in any colour, time-lapse and sun/moon size |
+| **Atmosphere** | Dynamic time-of-day lighting with sun strength and night brightness, time-of-day colour, realistic (Future) lighting on request, dynamic or fixed clock, a custom atmosphere (fog, haze, sun glare, fog tint, morning mist, cave fog), light shafts, custom clouds (cover, thickness, tint, cloud shadows), custom stars, the Milky Way, shooting stars and meteor showers in any colour, and a full-sky aurora (crisp flickering rays over a soft curtain glow) with five palettes or your own gradient |
+| **World** | Clear, rain, storm and snow weather, weather rotation with your own frequency and chances, wind, lightning with visible forked bolts, rainbows after rain or always, rain that keeps falling outside while you shelter, wet glossy surfaces, puddles (size, shine) with raindrop ripples, ground splashes, snow cover on terrain, fireflies and dust motes, indoor dust caught by the light, seasonal grass tints, a custom sun path and shadow softness |
+| **Materials** | Custom sky reflections and ambient, a sheen for every material that goes all the way to a mirror, **real reflections** of the world and players in puddles, floors, mirrors and glass, chrome avatars (a mirror layer over every body part and accessory, reflecting the players and buildings around them), shadows from local lights, light intensity, flicker and warmth, **Future lights** (a flashlight or lantern, glowing neon, lightning that lights the world and throws shadows, bounce light), light halos and contact shadows for Voxel and ShadowMap, terrain water styles or a custom water colour, and an underwater shader (fog, lens warp, bubbles, muffled audio) |
+| **Camera** | Bloom, lens flare, motion blur, replacing the game's own effects, depth of field with adaptive autofocus, auto exposure, tone mapping, Lightroom-style grading (exposure, contrast, highlights, shadows, whites, blacks, clarity, dehaze, vibrance, saturation, white balance, three colour wheels) with 16 presets, a Lightroom-style HSL colour mixer with smooth hue wheels and 15 LUTs, vignette, film grain, lens droplets and a speed FOV kick |
+| **Fun** | Filters (Noir, Sepia, Dream, Vapor, Night vision, Frostbite, Inferno), a hue cycle through the rainbow or your own gradient, tilt-shift, cinematic bars, camera wobble, a replacement mouse cursor and shift-lock cursor, avatar effects (colour cycle through a gradient, reflectance, material, ghost, headless, Korblox legs) for you or everyone, time-lapse and sun/moon size |
+| **Configs** | Save the look under a name, then load, update, rename or delete it (each asks first); share a look as a code and import other people's; your recent colours and gradient presets |
+| **Settings** | The dock's edge (right, left, top or bottom), theme presets (Dark, Midnight, Graphite, Light, Paper), accent colour, UI tint, contrast, the panel key, adaptive quality and more |
 
 ## Installation
 
@@ -32,6 +34,9 @@ governor.
 It also works from **StarterGui** or **StarterCharacterScripts**. On its first
 run it moves itself into PlayerScripts, so dying and respawning never reset it.
 Only one copy ever runs at a time.
+
+Then open section 0 at the top of the script, the [control panel](#for-developers),
+to choose which features players get and what they start with.
 
 ### Sync with Rojo
 
@@ -50,61 +55,74 @@ rojo build model.project.json -o Solstice.rbxm
 
 ### Executor build
 
-[`SolsticeShaders.exploit.luau`](SolsticeShaders.exploit.luau) is a standalone
-edition for executor environments. It is the same client-side cosmetic shader
-pack — it only renders, it reads no game state and touches no other players —
-repackaged so it loads from an executor instead of from a LocalScript:
+[`SolsticeShaders.exploit.luau`](SolsticeShaders.exploit.luau) is the same
+client-side cosmetic shader pack for executor environments. It only renders:
+it reads no game state and touches no other players. Load it with:
 
-- **Load it** with `loadstring(game:HttpGet("<raw url>"))()`, or paste the
-  whole file into the executor and run it. Running it again hot-reloads: the
-  previous copy unloads itself (restoring the place's lighting) first.
-- **Configs save to file.** Settings are stored as JSON in the executor's
-  workspace folder (`Solstice/` by default) instead of on a player attribute.
-  **Configs** is a tab in the dock like any other: under *Saved* you name and
-  **Save** the current look, then **Load** or **Delete** saved configs later.
-  The last one you saved or loaded comes back automatically on launch.
-- **Colours and gradients persist.** Recently used colours and the gradient
-  presets you save are written to `Solstice/library/`, so they survive
-  rejoins. *Configs → Library* lists them and lets you clear or delete them.
+```lua
+loadstring(game:HttpGet("https://raw.githubusercontent.com/xslvrrr/Solstice/refs/heads/main/SolsticeShaders.exploit.luau"))()
+```
+
+or paste the whole file into the executor and run it. What differs from the
+LocalScript:
+
+- **Hot reload.** Running it again unloads the previous copy first (restoring
+  the place's lighting).
+- **Everything saves to file.** The live settings, every config, your recent
+  colours and your gradient presets are JSON files in the executor's workspace
+  folder (`Solstice/` by default, `CONFIG.ConfigFolder`), so they survive
+  rejoins. Without a file API it falls back to the session.
+- **Copy buttons** in *Configs → Share* use the executor's clipboard.
 - **Console API.** `getgenv().SolsticeShaders` exposes `saveConfig(name)`,
-  `loadConfig(name)`, `deleteConfig(name)`, `listConfigs()` and `unload()`.
-- It parents its interface through `gethui()` / `CoreGui` when available so a
-  respawn or a GUI-resetting game does not take it down, and falls back to
-  `PlayerGui` otherwise. When the executor exposes no file API, configs cannot
-  be saved to disk and the Configs tab says so; the shaders still run and
-  settings persist for the session.
-
-The `CONFIG` block near the top adds `ConfigFolder` (where the files live) and
-`AutoLoadLastConfig` (load the last config on launch) on top of the options
-below.
+  `loadConfig(name)`, `deleteConfig(name)`, `listConfigs()`, `exportLook()`
+  and `unload()`.
+- It parents its interface through `gethui()` / `CoreGui` when available, so a
+  respawn or a GUI-resetting game doesn't take it down.
 
 ## Using it
 
-- **Open the dock:** move the pointer to the middle of the right-hand screen
-  edge, or press **F6**. F6 also works in first person, where the mouse is
-  locked. On touch screens, tap the right edge.
+- **On launch** the Solstice island appears at the screen edge, then folds
+  itself into the dock.
+- **Open the dock:** move the pointer to the middle of the dock's screen edge
+  (the right one by default), or press **F6**. The key also works in first
+  person, where the mouse is locked. On touch screens, tap the edge.
 - **Open a section:** click an icon and the dock stretches into a settings
   panel. The sub-tabs under the header switch between that section's parts,
   for example *Camera → Lens / Focus / Exposure / Grading / Mixer / Film*.
+  Options too long to sit side by side (like *Real reflections*) roll past one
+  at a time with the arrows.
 - **Close it:** click the active icon again, the close button, or anywhere in
   the game world.
-- **Switch everything off:** the power icon at the bottom of the dock turns
-  every effect off and restores the place's own lighting.
+- **Under the divider:** *Settings* (the panel's edge, theme and keys), and the
+  power icon, which turns every effect off and restores the place's own
+  lighting.
+- **Right-click** a saved config or a gradient preset for more options.
 
-Settings survive respawns and script restarts during a session. They're
-stored on an attribute of the local player.
+Settings survive respawns and script restarts during a session.
 
 ### From vanilla to anything
 
 Every setting starts at a value that leaves the place exactly as Roblox
 renders it. Solstice runs but touches nothing until you change something, so
 the base config makes no difference. That includes the place's own Atmosphere,
-Sky and Clouds, its wind, its post effects and its lighting style: each is
-only taken over while a setting asks for it, and handed straight back after.
+Sky and Clouds, its wind, its post effects, its lighting style and the mouse
+cursor: each is only taken over while a setting asks for it, and handed
+straight back after.
 
 From there each feature goes as far as you like; most ranges run well past
-what looks natural. **Reset** in the panel footer puts everything back to
-vanilla.
+what looks natural. **Reset** in the panel footer puts the look back to vanilla
+(it asks first; your configs and interface settings stay).
+
+### Configs
+
+*Configs → Saved*: type a name and **Save** the look. Each saved config can be
+loaded, updated with the current look, renamed or deleted, and each of those
+asks for confirmation first. A config holds the look only, not the Settings
+tab.
+
+*Configs → Share*: **Copy** the current look as a code (one line of text) and
+send it to anyone; **Import** pastes someone else's code, names it and offers
+to load it.
 
 ### Reflections
 
@@ -118,34 +136,53 @@ kind: real reflections of the structures and players around you.
   not at all), its Reflectance and the rain make it. *Floor gloss* scales it.
 - **All:** also mirrors, foil and glass nearby.
 
-*Chrome avatars* (You or Everyone) turns bodies into mirrors: their largest
-parts reflect the players and nearest buildings around them, with an optional
-sky sheen on top. A reflection never contains another reflection.
+*Chrome avatars* (You or Everyone) covers every body part and accessory with a
+mirror layer (*Chrome layer*), and the larger body parts also reflect the
+players and buildings around them (*Chrome reflections*). A reflection never
+contains another reflection. *Fun → Avatar → Reflectance* is the plain sky
+sheen on its own.
 
 How it works: Roblox can only draw a scene twice through a ViewportFrame, so
 each surface gets a ViewportFrame on a SurfaceGui holding mirrored copies of
 the nearby structures (the most important first, up to *Reflected detail*) and
 players, with a camera aimed so each reflected point lands where your eye's
-ray meets the surface. Because it is drawn on the surface itself, anything in
-front of it hides it. A floor reflects a long band ahead of you, about three
-camera-heights wide (a camera's lens cannot open wider than 120 degrees across).
-Terrain, particles and effects are not reflected. Distortion makes the image
-drift like water; height fade fades things as they rise from the surface.
+ray meets the surface. A ViewportFrame only draws when its GUI lives under
+PlayerGui (or the core GUI), so the SurfaceGuis sit there and are shown on
+their surfaces through `Adornee`. Because a reflection is drawn on the surface
+itself, anything in front of it hides it. A floor reflects a long band ahead
+of you, about three camera-heights wide (a camera's lens can't open wider than
+120 degrees across). Terrain, particles and effects aren't reflected.
+*Distortion* makes the image drift like water; *Height fade* fades things as
+they rise from the surface.
 
 ### Colours
 
 Colour settings open a picker inside the row: a saturation/value square and a
-hue bar, a hex field, and your recently used colours. The grading wheels use a
-hue/saturation field, since a wheel only picks a hue and how much of it to add.
+hue bar, a hex field, and your recently used colours (scroll sideways). Edits
+show live; **Confirm** keeps the colour (and adds it to your recent colours),
+while **Cancel**, or closing the row, puts the old one back. Nothing is saved
+until you confirm. The grading wheels use a hue/saturation field, since a
+wheel only picks a hue and how much of it to add.
 
-*Atmosphere → Aurora → Colours → Custom* adds a gradient editor: click the bar
-to add a stop, drag a handle to move it, pick its colour below, and save the
-result as a preset. Recent colours and saved gradients last the session in the
-LocalScript and survive rejoins in the executor build.
+Gradient settings (custom auroras, the hue cycle, the avatar colour cycle) open
+the gradient editor:
+
+- Click the bar to add a stop, and drag a handle to move it.
+- Set the selected stop's exact position, or remove it.
+- Pick its colour below.
+- **Reverse** or **Distribute** the stops.
+- **Save preset** names your gradient. Right-click your own presets to rename
+  or delete them.
+
+Like the picker, the editor only keeps what you **Confirm**. Recent colours and
+presets last the session in the LocalScript, and survive rejoins in the
+executor build (or with [your own storage](#keeping-configs-for-good)).
 
 *Camera → Mixer* works like Lightroom's HSL panel: eight colour bands, each
-with a hue ring (drag round it to choose what that colour becomes),
-saturation and luminance.
+with a smooth hue wheel (drag round it to choose what that colour becomes),
+saturation and luminance. *LUT* fills all of them with a finished look (Teal &
+orange, Autumn, Kodachrome, Cyberpunk, Matrix and more); editing any band
+afterwards turns it into Custom.
 
 Roblox's only colour post effect is one global tint, saturation and contrast,
 so no script can pick out "just the reds" on screen. The mixer therefore runs
@@ -164,81 +201,263 @@ light, fog, clouds, water, lamps, terrain and nearby parts. This is exactly
 per colour, but it changes those instances. Every original is recorded and put
 back.
 
+### Cursor
+
+*Fun → Camera → Cursor* replaces the mouse pointer (a dot, cross or circle in
+any colour and size, the shift-lock reticle, or the arrow). *Shift-lock cursor*
+is chosen separately and applies while the mouse is locked to the centre
+(shift lock or first person). So you can keep the arrow in shift lock, or use
+the reticle everywhere. While the panel is open, the game's own cursor comes
+back.
+
 ### Performance
 
 Settings that cost real frame time are *tiers* (Off / Low / … / Ultra). Each
 tier has a load score from 0 to 4, shown as coloured pips next to the setting.
 The scores add up to the **load meter** in the panel header.
 
-- **Adaptive:** when this is on, the governor watches your frame rate. If it
-  drops below the target, the governor lowers tiers a step at a time (it never
-  turns them off). It raises them again once there's headroom. While it's
-  holding tiers down, the meter shows "eased".
+*Settings → Behaviour → Adaptive quality* watches your frame rate. When it drops
+below the target, it lowers tiers a step at a time (it never turns them off),
+and raises them again once there's headroom. While it's holding tiers down, the
+meter shows "eased" and the footer says so.
 
 ### Lighting technology
 
 Solstice detects which lighting pipeline is actually running (Future,
 ShadowMap, Voxel or Compatibility) and checks your graphics quality level. The
 chip in the panel header shows the result. Settings that only exist in Future
-lighting, such as shadows from local lights, are locked with a badge on other
-pipelines. They don't silently do nothing. On Voxel and ShadowMap, *Materials →
-Voxel* recreates two Future looks: halos around lamps and contact shadows under
-characters.
+lighting, such as shadows from local lights and the Future lights, are locked
+with a badge on other pipelines. They don't silently do nothing.
 
-*Atmosphere → Light → Realistic lighting* asks the engine for the Realistic
-(Future) lighting style when the place isn't already using it, and puts the
-place's own style back when you switch it off.
+*Atmosphere → Light → Realistic lighting* switches the place to the Realistic
+(Future) lighting style when it isn't already using it. The chip then reads
+"Future (forced)", every Future-only row unlocks, and the Voxel recreations
+(halos, contact shadows) step aside. Switching it off puts the place's own
+style back. On Voxel and ShadowMap, *Materials → Voxel* recreates two Future
+looks: halos around lamps and contact shadows under characters.
 
-## Configuration
+### The interface
 
-The `CONFIG` table near the top of the script (section 2) holds the settings
-a developer is most likely to change:
+*Settings → Layout → Position* puts the dock on any screen edge: right, left,
+top (below Roblox's top bar) or bottom. The panel opens from it, and the reveal
+zone, magnification and tooltips follow.
+
+*Settings → Theme* has five presets: Dark, Midnight, Graphite, Light and
+Paper. You can also set:
+
+- **Accent:** the colour of buttons, toggles and highlights.
+- **UI tint:** how much the accent colours the panel's own surfaces.
+- **Contrast:** how far apart the layers sit, and how strong text is.
+
+Text colours always adapt. Each is checked against every surface it appears on
+and pushed lighter or darker until it reaches readable contrast (7:1 for main
+text, 4.5:1 for secondary, 3:1 for hints). Text on accent buttons switches
+between white and near-black, whichever reads better.
+
+## For developers
+
+### The control panel
+
+Section 0 at the very top of the script, `CONFIG`, is the control panel.
+Nothing below it needs editing to choose features, defaults or storage.
+
+**Switch features off** with `Features`. A key is a tab, a sub-tab or a single
+setting. A switched-off setting disappears from the panel and stays at its
+default for every player, so you can force a value by giving it a default
+below.
+
+```lua
+Features = {
+	configs = true,          -- the Configs tab
+	ui = true,               -- the Settings tab
+	fun = false,             -- the whole Fun tab
+	["cam.mixer"] = false,   -- the Camera > Mixer sub-tab
+	["mat.mirrors"] = false, -- one setting: Real reflections
+},
+```
+
+Tab ids: `atmo`, `world`, `mat`, `cam`, `fun`, `configs`, `ui`. Setting ids are
+`tab.key`, as written in section 7 (for example `Toggle("dynamic", ...)` in the
+Atmosphere tab is `atmo.dynamic`).
+
+**Change what players start with** with `Defaults`. Players start there, and
+*Reset* returns there.
+
+```lua
+Defaults = {
+	["atmo.dynamic"] = true,
+	["world.weather"] = "Rain",        -- choices and tiers take the option's name
+	["cam.bloom"] = "Full",
+	["atmo.fogTint"] = "FFD9B0",       -- colours take "RRGGBB" or a Color3
+	["ui.side"] = "Left",              -- the dock on the left
+	["ui.accent"] = Color3.fromRGB(240, 140, 70),
+	["atmo.auroraGradient"] = {        -- gradients take { position, Color3 } stops
+		{ 0, Color3.fromRGB(255, 80, 170) },
+		{ 1, Color3.fromRGB(90, 255, 150) },
+	},
+},
+```
+
+The fastest way to write that table: set the look up in game, open
+**Configs → Share → This look as defaults** and press **Print as defaults**.
+The `Defaults` table for exactly that look is printed to the output (F9),
+ready to paste. A value that doesn't fit its setting is reported as a warning
+at start-up, not silently ignored.
+
+The rest of `CONFIG`:
 
 | Option | Default | Purpose |
 | --- | --- | --- |
+| `Storage` | `nil` | Where configs are kept (see below). |
 | `StartEnabled` | `true` | Start with the shaders on. |
-| `ToggleKey` | `Enum.KeyCode.F6` | Key that opens and closes the panel. |
-| `MinQualityForFuture` | `4` | Graphics quality level below which Future-only rows are locked. |
-| `AdaptiveTargetFps` | `50` | Frame rate the Adaptive governor tries to hold. |
-| `LoadBudget` | `48` | Sum of load scores that fills the load meter. |
-| `ParticleTexture` | built-in smoke texture | Soft round texture used for rain, snow, dust, fireflies, halos and contact shadows. |
-| `WaterTag` | `"Water"` | CollectionService tag that marks parts as water volumes for the underwater effect. Terrain water is always detected. |
+| `ToggleKey` | `Enum.KeyCode.F6` | The panel key players start with (they can pick another in Settings). |
 | `PersistSettings` | `true` | Remember each player's settings across respawns. |
-| `IconAssets` | `{}` | Optional image IDs for the dock icons, keyed by tab id (`atmo`, `world`, `mat`, `cam`, `fun`, `power`, and `configs` in the executor build). By default the icons are drawn from frames. |
+| `MinQualityForFuture` | `4` | Graphics quality level below which Future-only rows are locked. |
+| `LoadBudget` | `48` | Sum of load scores that fills the load meter. |
+| `ParticleTexture` | built-in smoke texture | Soft round texture used for rain, snow, dust, fireflies, halos, contact shadows and the aurora's glow. |
+| `WaterTag` | `"Water"` | CollectionService tag that marks parts as water volumes for the underwater effect. Terrain water is always detected. |
+| `IconAssets` | `{}` | Optional image IDs for the dock icons, keyed by tab id (`atmo`, `world`, `mat`, `cam`, `fun`, `configs`, `ui`, `power`). By default the icons are drawn from frames. |
+
+The adaptive quality target and the panel's position, theme and key are
+player settings now (the Settings tab), so their defaults go in `Defaults`
+(`ui.targetFps`, `ui.side`, `ui.theme`, `ui.toggleKey`, ...).
+
+### Keeping configs for good
+
+A LocalScript can't write files, so by default saved configs, recent colours
+and gradient presets last the session (on attributes of the player). To keep
+them across sessions, give `CONFIG.Storage` four functions that talk to your
+server. Paths look like `configs/Night.json`, `library/recent.json` and
+`autosave.json`. For example, a RemoteFunction in front of a DataStore:
+
+```lua
+-- In CONFIG (section 0 of the LocalScript):
+Storage = (function()
+	local remote = game:GetService("ReplicatedStorage"):WaitForChild("SolsticeStorage")
+	return {
+		read = function(path) return remote:InvokeServer("read", path) end,
+		write = function(path, text) remote:InvokeServer("write", path, text) end,
+		delete = function(path) remote:InvokeServer("delete", path) end,
+		list = function(folder) return remote:InvokeServer("list", folder) end,
+	}
+end)(),
+```
+
+```lua
+-- A Script in ServerScriptService:
+local DataStoreService = game:GetService("DataStoreService")
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local store = DataStoreService:GetDataStore("SolsticeFiles")
+local remote = Instance.new("RemoteFunction")
+remote.Name = "SolsticeStorage"
+remote.Parent = ReplicatedStorage
+
+-- Every file of a player in one DataStore key, cached while they play and
+-- written back when they leave (and every two minutes).
+local cache, dirty = {}, {}
+
+local function files(player)
+	if not cache[player] then
+		local ok, data = pcall(store.GetAsync, store, "player_" .. player.UserId)
+		cache[player] = ok and type(data) == "table" and data or {}
+	end
+	return cache[player]
+end
+
+local function flush(player)
+	if dirty[player] and cache[player] then
+		dirty[player] = nil
+		pcall(store.SetAsync, store, "player_" .. player.UserId, cache[player])
+	end
+end
+
+remote.OnServerInvoke = function(player, action, path, text)
+	if type(path) ~= "string" or #path > 120 then
+		return nil
+	end
+	local data = files(player)
+	if action == "read" then
+		return data[path]
+	elseif action == "write" and type(text) == "string" and #text < 100000 then
+		data[path] = text
+		dirty[player] = true
+	elseif action == "delete" then
+		data[path] = nil
+		dirty[player] = true
+	elseif action == "list" then
+		local names, prefix = {}, path .. "/"
+		for name in data do
+			if name:sub(1, #prefix) == prefix and not name:find("/", #prefix + 1, true) then
+				table.insert(names, name:sub(#prefix + 1))
+			end
+		end
+		return names
+	end
+	return nil
+end
+
+Players.PlayerRemoving:Connect(function(player)
+	flush(player)
+	cache[player], dirty[player] = nil, nil
+end)
+game:BindToClose(function()
+	for player in cache do
+		flush(player)
+	end
+end)
+task.spawn(function()
+	while true do
+		task.wait(120)
+		for player in cache do
+			flush(player)
+		end
+	end
+end)
+```
 
 ### EditableImage
 
-The generated radial vignette, film grain and soft contact-shadow blob use
-`EditableImage`. Once the experience is published, that API has to be allowed
-in the experience's settings. Without it, the vignette falls back to edge
-gradients, contact shadows use the stock particle texture and the *Film grain*
-row is locked.
+The generated radial vignette, film grain, soft contact-shadow blob and the
+mixer's smooth hue wheels use `EditableImage`. Once the experience is
+published, that API has to be allowed in the experience's settings. Without
+it:
+
+- The vignette falls back to edge gradients.
+- Contact shadows use the stock particle texture.
+- The hue wheels are built from short gradient arcs instead.
+- The *Film grain* row is locked.
 
 ## Leaves no trace
 
 Solstice either creates what it touches (and destroys it when switched off) or
 records the original value first and puts it back afterwards (the moment the
 setting that needed it is switched off, not only when the shaders stop). That
-covers
-Lighting properties, the clock, terrain water and material colours, the
-place's Atmosphere, Sky and Clouds, its wind, lighting style and post effects,
-light shadows, brightness and colour, part and avatar reflectance, part colour,
-ambient reverb and the camera's field of view. The records are
-also stored on the instances themselves. If a copy of the script dies without
-cleaning up, the next copy restores the place before it starts. If the game
-deletes something Solstice made, it rebuilds itself.
+covers:
+
+- Lighting properties, the clock, and terrain water and material colours.
+- The place's Atmosphere, Sky and Clouds, its wind, lighting style and post
+  effects.
+- Light shadows, brightness and colour.
+- Part and avatar reflectance, material, transparency and colour.
+- The mouse cursor, ambient reverb and the camera's field of view.
+
+The records are also stored on the instances themselves. If a copy of the
+script dies without cleaning up, the next copy restores the place before it
+starts. If the game deletes something Solstice made, it rebuilds itself.
 
 ## Project layout
 
 ```
 SolsticeShaders.client.luau   the whole shader pack (one LocalScript)
-SolsticeShaders.exploit.luau  the executor build (file-saved configs + UI)
+SolsticeShaders.exploit.luau  the executor build (file-saved configs)
 default.project.json          Rojo project: syncs the LocalScript to StarterPlayerScripts
 model.project.json            Rojo project: builds the LocalScript as a standalone model
 ```
 
 The script is split into numbered sections. Search for the banners
-(`-- 1. SERVICES & GUARDS` … `-- 22. BOOT`). The header comment at the top of
+(`-- 0. CONTROL PANEL` … `-- 22. BOOT`). The header comment at the top of
 the file maps them out.
 
 ## Development
@@ -252,5 +471,7 @@ curl -L -o globalTypes.d.luau \
 luau-lsp analyze --platform=roblox --definitions=globalTypes.d.luau SolsticeShaders.client.luau
 ```
 
-The executor build checks the same way, apart from the executor's own globals
-(`getgenv`, `gethui`), which the Roblox definitions don't know about.
+The executor build is the LocalScript plus a small set of changes (header,
+single-copy guard, GUI parent, file storage, clipboard and console API). It
+checks the same way, apart from the executor's own globals (`getgenv`,
+`gethui`), which the Roblox definitions don't know about.
