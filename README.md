@@ -81,8 +81,9 @@ LocalScript:
 
 ## Using it
 
-- **On launch** the Solstice island appears at the screen edge, then folds
-  itself into the dock.
+- **On launch** the Solstice island opens at the screen edge: a sun rises over
+  a horizon, the name writes itself in, you're greeted for the time of day and
+  shown the panel key. Then the island folds itself into the dock.
 - **Open the dock:** move the pointer to the middle of the dock's screen edge
   (the right one by default), or press **F6**. The key also works in first
   person, where the mouse is locked. On touch screens, tap the edge.
@@ -97,6 +98,8 @@ LocalScript:
   power icon, which turns every effect off and restores the place's own
   lighting.
 - **Right-click** a saved config or a gradient preset for more options.
+- **Hover** the coloured cost pips beside a setting, the load bar or the
+  lighting chip in the header to see what they mean.
 
 Settings survive respawns and script restarts during a session.
 
@@ -131,10 +134,24 @@ to a perfect mirror. *Materials → Mirrors → Real reflections* is the other
 kind: real reflections of the structures and players around you.
 
 - **Puddles:** rain puddles reflect what is around and above them.
-- **Floors:** also the floor you stand on, as glossy as its material (glass,
-  marble and tiles strongly, plain plastic and wood a little, grass and sand
-  not at all), its Reflectance and the rain make it. *Floor gloss* scales it.
-- **All:** also mirrors, foil and glass nearby.
+- **Floors:** also the glossy floors around and ahead of you, as glossy as
+  their material (glass, marble and tiles strongly, plain plastic and wood a
+  little, grass and sand not at all), their Reflectance and the rain make
+  them. *Floor gloss* scales it.
+
+Floors are found by a fan of rays falling from points around and ahead of
+your character. The glossy surfaces they land on are grouped by height, so a
+floor made of many tiles is one floor, and the two best groups reflect. The
+rays start from your character rather than the camera, so jumping changes
+nothing.
+
+*Reflection detail* is a level of detail, not a count:
+
+- **Near things** are copied in full, with their meshes and decals.
+- **Further ones** become plain blocks of their size and colour.
+- **Small things** drop out first as they get further away.
+
+Higher detail keeps more, further out.
 
 *Chrome avatars* (You or Everyone) covers every body part and accessory with a
 mirror layer (*Chrome layer*), and the larger body parts also reflect the
@@ -144,7 +161,7 @@ sheen on its own.
 
 How it works: Roblox can only draw a scene twice through a ViewportFrame, so
 each surface gets a ViewportFrame on a SurfaceGui holding mirrored copies of
-the nearby structures (the most important first, up to *Reflected detail*) and
+the nearby structures (by level of detail, see above) and
 players, with a camera aimed so each reflected point lands where your eye's
 ray meets the surface. A ViewportFrame only draws when its GUI lives under
 PlayerGui (or the core GUI), so the SurfaceGuis sit there and are shown on
@@ -152,8 +169,9 @@ their surfaces through `Adornee`. Because a reflection is drawn on the surface
 itself, anything in front of it hides it. A floor reflects a long band ahead
 of you, about three camera-heights wide (a camera's lens can't open wider than
 120 degrees across). Terrain, particles and effects aren't reflected.
-*Distortion* makes the image drift like water; *Height fade* fades things as
-they rise from the surface.
+*Distortion* makes the reflection sway at two speeds, bends it slightly as if
+the surface weren't quite still, and drifts a soft ripple sheen across it.
+*Height fade* fades things as they rise from the surface.
 
 ### Colours
 
@@ -193,8 +211,10 @@ as a fitted post effect:
 3. The global colour balance and saturation that best reproduce the result
    become a grading layer.
 
-Change a colour that fills the screen and the image follows; change one that
-barely appears and it barely moves. *Mixer strength* scales it.
+The colours you change lead the fit: each sample counts by how much the mix
+moves it, so the rest of the screen barely holds it back. The layer is also
+driven harder than a plain fit. At *Mixer strength* 1x a change reads
+clearly, and at 2x it's as bold as an editor's sliders.
 
 *Also recolour the world* applies the exact mix to the scene as well: the
 light, fog, clouds, water, lamps, terrain and nearby parts. This is exactly
@@ -239,8 +259,10 @@ looks: halos around lamps and contact shadows under characters.
 ### The interface
 
 *Settings → Layout → Position* puts the dock on any screen edge: right, left,
-top (below Roblox's top bar) or bottom. The panel opens from it, and the reveal
-zone, magnification and tooltips follow.
+top (below Roblox's top bar, and fully behind it when hidden) or bottom. The
+panel opens from it, and the reveal zone, magnification and tooltips follow.
+On the top and bottom edges the panel is wide and short, with its rows in two
+columns.
 
 *Settings → Theme* has five presets: Dark, Midnight, Graphite, Light and
 Paper. You can also set:
@@ -253,6 +275,40 @@ Text colours always adapt. Each is checked against every surface it appears on
 and pushed lighter or darker until it reaches readable contrast (7:1 for main
 text, 4.5:1 for secondary, 3:1 for hints). Text on accent buttons switches
 between white and near-black, whichever reads better.
+
+### When something breaks
+
+Every feature runs on its own, so an error in one (a broken avatar, a part
+the game deleted mid-frame) never stops the others or switches the shaders
+off.
+
+- **A feature that keeps failing** is set aside: it stops running, and what it
+  changed is put back where possible.
+- **A notification appears** in the corner (bottom right, or top right with
+  the dock on the bottom). It names the feature and offers **Turn off** and
+  **Retry**.
+- **Switching the shaders off and on** retries everything.
+- **If a whole frame keeps failing,** the shaders restore the place, switch
+  off and tell you, with a button to turn them back on.
+
+Switching off and restoring also run step by step, so one failing step can't
+leave the place half restored.
+
+### Korblox legs
+
+*Fun → Avatar → Korblox leg* uses the official Korblox Deathspeaker legs:
+
+- **Right:** the bony right leg.
+- **Left:** the left leg from the same bundle.
+- **Both:** each leg on its own side.
+
+They come from the official body-part assets: Right Leg 139607718 (meshes
+9598310133/38/28, texture 902843398) and Left Leg 139607673 (meshes
+9598310131/37/18, texture 902842271), plus the R6 CharacterMeshes. Each R15
+piece hangs from the same hip, knee or ankle joint as the player's own and
+follows their body scale. A LocalScript can't change a MeshPart's mesh, so the
+leg is drawn by parts that follow the real one, which is hidden. Only you see
+it.
 
 ## For developers
 
