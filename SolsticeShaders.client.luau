@@ -1,0 +1,7638 @@
+--!nonstrict
+--[[
+================================================================================
+  SOLSTICE  ·  a Complementary-style "shader pack" for Roblox in one LocalScript
+================================================================================
+
+  WHERE IT GOES
+      StarterPlayer > StarterPlayerScripts > LocalScript  (paste this whole file)
+      It also works from StarterGui or StarterCharacterScripts: on first run it
+      moves itself into PlayerScripts so death and respawn never reset it.
+
+  WHAT IT IS
+      Roblox does not let scripts run custom GLSL, so nothing here is a real
+      fragment shader. Solstice instead drives everything the engine does expose
+      (Lighting, Atmosphere, Clouds, Sky, post-processing, Terrain water, local
+      lights, part reflectance, particles, beams, sound effects and a screen
+      overlay) from one simulation, which is how it gets the Complementary
+      Unbound + Euphoria Patches feel: time-of-day colour, atmospheric fog,
+      morning mist, cave fog, cloud shadows, light shafts, auto exposure,
+      weather with rain puddles and ripples, wet reflective surfaces, snow
+      cover, a full-sky aurora, shooting stars, the Milky Way, rainbows,
+      lightning bolts, an underwater shader, Lightroom-style colour grading,
+      and more.
+
+  HOW IT IS LAID OUT (search for the numbered banners)
+       1  Services & guards          12  Surfaces (material reflectance)
+       2  Configuration              13  Underwater and audio
+       3  Theme                      14  Post-processing and camera
+       4  Maths & instance helpers   15  Screen overlay
+       5  Motion (springs)           16  Adaptive quality + engine lifecycle
+       6  Renderer detection         17  Interface layout and primitives
+       7  Settings schema & store    18  Controls (toggle, slider, segmented)
+       8  Lighting, sky, atmosphere  19  Rows
+       9  World: weather, puddles    20  Dock icons
+      10  Sky spectacles             21  The surface: build, morph, per-frame
+      11  Lights, halos, contact     22  Boot
+          shadows
+
+  USING IT
+      Move the pointer to the middle of the right screen edge to reveal the
+      dock, or press F6. Click an icon to stretch the dock into that section;
+      the row of sub-tabs under the header switches between its parts (for
+      example Camera > Lens / Focus / Exposure / Grading / Film). Click the icon
+      again, the close button, or the game world to fold it back. The power
+      icon at the bottom switches every effect off and restores the place's
+      own lighting. Settings survive respawns.
+
+  FUTURE IS BRIGHT
+      Section 6 works out which lighting pipeline is really running. It reads
+      Lighting.Technology when the engine allows it, falls back to LightingStyle
+      and PrioritizeLightingQuality (the properties that superseded Technology),
+      and folds in the player's graphics quality level. Every effect that only
+      exists in Future lighting (shadows from local lights, soft shadows) checks
+      those capabilities, and the interface locks the matching rows with a badge
+      instead of silently doing nothing. On Voxel and ShadowMap, Materials >
+      Voxel recreates two Future looks: halos around lamps and contact shadows
+      under characters.
+
+  PERFORMANCE MODEL
+      Settings that cost real frame time are "tiers" (Off / Low / ... / Ultra)
+      with a load score from 0 to 4, shown as coloured pips beside the setting.
+      The scores add up to the load meter in the panel header. The Adaptive
+      governor watches frame rate and temporarily steps tiers down (never off)
+      when the frame rate sags, then steps them back up when there is headroom.
+      Expensive work is spread out: sky probes run one ray per tick, surfaces
+      are adopted a few per frame, the aurora animates at 15 Hz from
+      precomputed curves, and an idle dock skips its layout pass entirely.
+
+  CLEAN EXIT
+      Everything the script touches is either created by it (and destroyed when
+      the shaders are switched off) or recorded first and restored afterwards.
+      If the game deletes something Solstice made, it rebuilds itself.
+================================================================================
+]]
+
+--------------------------------------------------------------------------------
+-- 1. SERVICES & GUARDS
+--------------------------------------------------------------------------------
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local Lighting = game:GetService("Lighting")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local AssetService = game:GetService("AssetService")
+local SoundService = game:GetService("SoundService")
+local CollectionService = game:GetService("CollectionService")
+local HttpService = game:GetService("HttpService")
+local Workspace = game:GetService("Workspace")
+
+local localPlayer = Players.LocalPlayer
+if not localPlayer then
+	-- Running on the server (or in a plugin context): there is no screen to shade.
+	return
+end
+
+-- Only one copy may run: a second one would fight the first over every
+-- Lighting property. The running copy keeps a heartbeat (os.clock() on an
+-- attribute, refreshed twice a second), so a copy that died without a chance
+-- to clean up (a destroyed script's own Destroying handler never runs under
+-- deferred signals) can never block its successor for long.
+local RUNNING_ATTRIBUTE = "SolsticeRunning"
+local STATE_ATTRIBUTE = "SolsticeState"
+local HEARTBEAT_TIMEOUT = 2.5
+do
+	local beat = localPlayer:GetAttribute(RUNNING_ATTRIBUTE)
+	if type(beat) == "number" and os.clock() - beat < HEARTBEAT_TIMEOUT then
+		return
+	end
+end
+
+-- Survive death and respawn. A LocalScript placed in StarterGui or
+-- StarterCharacterScripts is destroyed and re-created every time the
+-- character respawns, which used to tear the shaders down mid-game. So the
+-- first copy to run hands itself over to PlayerScripts, which is never reset,
+-- and quietly bows out; every later copy finds the heartbeat and returns.
+do
+	local playerScripts = localPlayer:FindFirstChildOfClass("PlayerScripts")
+	if playerScripts and not script:IsDescendantOf(playerScripts) then
+		local moved = pcall(function()
+			local copy = script:Clone()
+			copy.Name = "Solstice"
+			copy.Parent = playerScripts
+		end)
+		if moved then
+			return
+		end
+		-- Not cloneable (Archivable off, or a sandboxed context): run in place.
+		-- If this copy dies with the character, the next one sees the
+		-- heartbeat stop and takes over, undoing whatever this one left
+		-- behind (see Baseline.recover).
+	end
+end
+local heartbeatConnection = RunService.RenderStepped:Connect(function()
+	local beat = localPlayer:GetAttribute(RUNNING_ATTRIBUTE)
+	if type(beat) == "number" then
+		local now = os.clock()
+		if now - beat > 0.5 then
+			localPlayer:SetAttribute(RUNNING_ATTRIBUTE, now)
+		end
+	end
+end)
+
+local playerGui = localPlayer:WaitForChild("PlayerGui")
+
+--------------------------------------------------------------------------------
+-- 2. CONFIGURATION
+--    Things a developer may want to change without reading the rest.
+--------------------------------------------------------------------------------
+
+local CONFIG = {
+	-- Start with the shaders switched on.
+	StartEnabled = true,
+
+	-- Opens / closes the panel from the keyboard. Useful in first person, where
+	-- the mouse is locked and cannot reach the edge of the screen.
+	ToggleKey = Enum.KeyCode.F6,
+
+	-- The game's own post effects (Bloom, ColorCorrection, ...) are switched off
+	-- while Solstice is running so they do not stack with ours, and switched
+	-- back on when it stops. Set to false to layer on top of them instead.
+	SuppressGameEffects = true,
+
+	-- Ask the engine for the Realistic (Future) lighting style if the place is
+	-- not already using it. The request is wrapped in pcall: on engine versions
+	-- where these properties are not script-writable it simply does nothing.
+	RequestRealisticLighting = true,
+
+	-- Future lighting quietly drops its expensive features at low graphics
+	-- quality levels. Roblox does not publish the exact cut-off, so this is a
+	-- deliberately conservative guess; below it, Future-only rows are locked.
+	MinQualityForFuture = 4,
+
+	-- The Adaptive governor tries to keep the frame rate above this.
+	AdaptiveTargetFps = 50,
+
+	-- Sum of load scores that fills the load meter to 100%.
+	LoadBudget = 48,
+
+	-- Soft round particle used for rain, snow, dust, fireflies, halos and the
+	-- contact-shadow blob. It ships with the client, so no upload is needed.
+	ParticleTexture = "rbxasset://textures/particles/smoke_main.dds",
+
+	-- Parts carrying this CollectionService tag count as water volumes for the
+	-- underwater effect (terrain water is always detected).
+	WaterTag = "Water",
+
+	-- Remember the player's settings across respawns (and across script
+	-- restarts within one session) on an attribute of the local player.
+	PersistSettings = true,
+
+	-- Optional image icons for the dock, keyed by tab id ("atmo", "world",
+	-- "mat", "cam", "fun", "power"). Left empty, icons are drawn from frames.
+	IconAssets = {},
+}
+
+--------------------------------------------------------------------------------
+-- 3. THEME
+--    Linear-like: near-black surfaces, hairline borders, one indigo accent,
+--    and a 12 / 8 / 6 radius ladder (window / row / control).
+--------------------------------------------------------------------------------
+
+local function rgb(r, g, b)
+	return Color3.fromRGB(r, g, b)
+end
+
+local THEME = {
+	surface = rgb(16, 17, 19),
+	surfaceRaised = rgb(24, 25, 28),
+	control = rgb(31, 32, 36),
+	controlActive = rgb(48, 50, 57),
+	border = rgb(35, 37, 42),
+	borderStrong = rgb(52, 54, 61),
+	text = rgb(247, 248, 248),
+	textSecondary = rgb(150, 154, 163),
+	textTertiary = rgb(98, 102, 109),
+	accent = rgb(94, 106, 210),
+	green = rgb(76, 183, 130),
+	yellow = rgb(242, 201, 76),
+	orange = rgb(242, 153, 74),
+	red = rgb(235, 87, 87),
+	disabledTint = rgb(112, 112, 116),
+	white = rgb(255, 255, 255),
+}
+
+local RADIUS = { dock = 17, shell = 12, row = 8, control = 6, chip = 5 }
+
+local FONT_FAMILY = "rbxasset://fonts/families/GothamSSm.json"
+local FONT = {
+	regular = Font.new(FONT_FAMILY, Enum.FontWeight.Regular),
+	medium = Font.new(FONT_FAMILY, Enum.FontWeight.Medium),
+	bold = Font.new(FONT_FAMILY, Enum.FontWeight.Bold),
+}
+
+-- Load score (1..4) -> pip colour.
+local LOAD_COLORS = { THEME.green, THEME.yellow, THEME.orange, THEME.red }
+
+--------------------------------------------------------------------------------
+-- 4. MATHS & INSTANCE HELPERS
+--------------------------------------------------------------------------------
+
+local function clamp01(x)
+	return math.clamp(x, 0, 1)
+end
+
+local function lerp(a, b, t)
+	return a + (b - a) * t
+end
+
+local function smoothstep(edge0, edge1, x)
+	local t = clamp01((x - edge0) / (edge1 - edge0))
+	return t * t * (3 - 2 * t)
+end
+
+-- Frame-rate independent "move a fraction of the way there" smoothing.
+-- `rate` is roughly "how many times per second the gap shrinks by 63%".
+local function approach(current, target, rate, dt)
+	return current + (target - current) * (1 - math.exp(-rate * dt))
+end
+
+local function snapToStep(value, step)
+	return math.floor(value / step + 0.5) * step
+end
+
+local function multiplyColor(a, b)
+	return Color3.new(a.R * b.R, a.G * b.G, a.B * b.B)
+end
+
+local function scaleColor(color, scale)
+	return Color3.new(clamp01(color.R * scale), clamp01(color.G * scale), clamp01(color.B * scale))
+end
+
+local function luminance(color)
+	return color.R * 0.2126 + color.G * 0.7152 + color.B * 0.0722
+end
+
+-- A pure hue (0..360 degrees) at the given saturation, full value. Used by
+-- the colour wheels in the grade, where "amount" is the saturation.
+local function hueTint(degrees, amount)
+	return Color3.fromHSV((degrees % 360) / 360, clamp01(amount), 1)
+end
+
+-- NumberSequence from { {time, value}, ... }.
+local function numberSequence(points)
+	local keypoints = table.create(#points)
+	for index, point in points do
+		keypoints[index] = NumberSequenceKeypoint.new(point[1], point[2])
+	end
+	return NumberSequence.new(keypoints)
+end
+
+-- ColorSequence from { {time, Color3}, ... }.
+local function colorSequence(points)
+	local keypoints = table.create(#points)
+	for index, point in points do
+		keypoints[index] = ColorSequenceKeypoint.new(point[1], point[2])
+	end
+	return ColorSequence.new(keypoints)
+end
+
+-- Random float in [low, high).
+local random = Random.new()
+local function between(low, high)
+	return low + (high - low) * random:NextNumber()
+end
+
+-- Instance.new with a property table and optional children. Parent is always
+-- assigned last, which is both faster and avoids half-configured instances
+-- flashing on screen for a frame.
+local function create(className, properties, children)
+	local instance = Instance.new(className)
+	local parent = nil
+	if properties then
+		for key, value in properties do
+			if key == "Parent" then
+				parent = value
+			else
+				(instance :: any)[key] = value
+			end
+		end
+	end
+	if children then
+		for _, child in children do
+			child.Parent = instance
+		end
+	end
+	if parent then
+		instance.Parent = parent
+	end
+	return instance
+end
+
+-- Some properties are security-gated or missing on older engine versions.
+-- These two never throw; a failed read returns nil, a failed write false.
+local function readProperty(instance, property)
+	local ok, value = pcall(function()
+		return (instance :: any)[property]
+	end)
+	if ok then
+		return value
+	end
+	return nil
+end
+
+local function writeProperty(instance, property, value)
+	local ok = pcall(function()
+		(instance :: any)[property] = value
+	end)
+	return ok
+end
+
+-- De-duplicating property writer used by the whole simulation.
+--
+-- The simulation recomputes every target every frame, but most targets move
+-- slowly or not at all. Writing an unchanged value still costs a reflection
+-- call and, for Lighting, can invalidate shadow maps. `put` remembers the last
+-- value it wrote per instance/property and skips anything within `epsilon`.
+local writeCache = setmetatable({}, { __mode = "k" })
+
+local function put(instance, property, value, epsilon)
+	local cache = writeCache[instance]
+	if not cache then
+		cache = {}
+		writeCache[instance] = cache
+	end
+	local last = cache[property]
+	if last ~= nil then
+		-- Numbers are by far the most common case, and `type` is a fast
+		-- builtin while `typeof` has to inspect userdata, so test it first.
+		if type(value) == "number" then
+			if math.abs(last - value) <= (epsilon or 0.002) then
+				return
+			end
+		else
+			local kind = typeof(value)
+			if kind == "Color3" then
+				if math.abs(last.R - value.R) + math.abs(last.G - value.G) + math.abs(last.B - value.B) < 0.006 then
+					return
+				end
+			elseif kind == "Vector3" then
+				if (last - value).Magnitude <= (epsilon or 0.05) then
+					return
+				end
+			elseif last == value then
+				return
+			end
+		end
+	end
+	cache[property] = value;
+	(instance :: any)[property] = value
+end
+
+-- `put` for a constant NumberSequence property, keyed by the plain number so
+-- a new sequence is only allocated when the value actually moves.
+local function putSequence(instance, property, value, epsilon)
+	local cache = writeCache[instance]
+	if not cache then
+		cache = {}
+		writeCache[instance] = cache
+	end
+	local key = "#" .. property
+	local last = cache[key]
+	if last ~= nil and math.abs(last - value) <= (epsilon or 0.002) then
+		return
+	end
+	cache[key] = value;
+	(instance :: any)[property] = NumberSequence.new(value)
+end
+
+-- Forget what was written to an instance, so the next `put` always lands.
+local function forget(instance, property)
+	local cache = writeCache[instance]
+	if cache then
+		if property then
+			cache[property] = nil
+		else
+			writeCache[instance] = nil
+		end
+	end
+end
+
+-- The write cache assumes nobody else touches what `put` wrote. Games do,
+-- though: a respawn handler that resets Lighting, a zone script that swaps
+-- the Atmosphere colour. Without this the cache would believe its value is
+-- still in place and never write it again. The watcher drops a cached value
+-- the moment the live property stops matching it, so the next frame re-asserts
+-- it. Our own writes match the cache and are ignored (with a tolerance, since
+-- the engine stores many numbers as 32-bit floats).
+local function sameValue(a, b)
+	if type(a) == "number" and type(b) == "number" then
+		return math.abs(a - b) <= 1e-4 * math.max(1, math.abs(a))
+	end
+	if typeof(a) == "Color3" and typeof(b) == "Color3" then
+		return math.abs(a.R - b.R) + math.abs(a.G - b.G) + math.abs(a.B - b.B) < 0.002
+	end
+	return a == b
+end
+
+local function watchWrites(instance)
+	return instance.Changed:Connect(function(property)
+		local cache = writeCache[instance]
+		local cached = cache and cache[property]
+		if cached ~= nil then
+			local ok, current = pcall(function()
+				return (instance :: any)[property]
+			end)
+			if ok and not sameValue(cached, current) then
+				cache[property] = nil
+			end
+		end
+	end)
+end
+
+-- Paint a square RGBA texture from a function of (x, y) with EditableImage.
+-- Returns nil when the image API is unavailable (it must be enabled in the
+-- experience's settings once published), so every caller needs a fallback.
+local function paintTexture(size, painter)
+	local ok, image = pcall(function()
+		local editable = AssetService:CreateEditableImage({ Size = Vector2.new(size, size) })
+		if not editable then
+			return nil
+		end
+		local pixels = buffer.create(size * size * 4)
+		for y = 0, size - 1 do
+			for x = 0, size - 1 do
+				local r, g, b, a = painter(x, y)
+				local offset = (y * size + x) * 4
+				buffer.writeu8(pixels, offset, r)
+				buffer.writeu8(pixels, offset + 1, g)
+				buffer.writeu8(pixels, offset + 2, b)
+				buffer.writeu8(pixels, offset + 3, a)
+			end
+		end
+		editable:WritePixelsBuffer(Vector2.zero, Vector2.new(size, size), pixels)
+		return editable
+	end)
+	return ok and image or nil
+end
+
+local function tween(instance, duration, goal, style, direction)
+	local info = TweenInfo.new(duration, style or Enum.EasingStyle.Quad, direction or Enum.EasingDirection.Out)
+	local animation = TweenService:Create(instance, info, goal)
+	animation:Play()
+	return animation
+end
+
+--------------------------------------------------------------------------------
+-- 5. MOTION
+--    A small damped-spring animator. Springs are what give the interface its
+--    bouncy, physical feel: a damping ratio below 1 overshoots and settles,
+--    1 is critically damped (no overshoot), above 1 is sluggish.
+--
+--    The step uses the closed-form solution of the spring equation rather than
+--    Euler integration, so it stays stable at any frame rate and after hitches.
+--------------------------------------------------------------------------------
+
+local Motion = { active = {} }
+
+local Spring = {}
+Spring.__index = Spring
+
+-- frequency: oscillations per second.  damping: 1 = no bounce, 0.5 = bouncy.
+-- onStep(value) is called whenever the value changes.
+function Motion.spring(initial, frequency, damping, onStep)
+	return setmetatable({
+		value = initial,
+		target = initial,
+		velocity = 0,
+		frequency = frequency,
+		damping = damping,
+		onStep = onStep,
+		running = false,
+	}, Spring)
+end
+
+function Spring:wake()
+	if not self.running then
+		self.running = true
+		table.insert(Motion.active, self)
+	end
+end
+
+-- Animate towards `target`.
+function Spring:to(target)
+	if self.target ~= target then
+		self.target = target
+		self:wake()
+	end
+end
+
+-- Jump to `value` with no animation.
+function Spring:snap(value)
+	self.value = value
+	self.target = value
+	self.velocity = 0
+	if self.onStep then
+		self.onStep(value)
+	end
+end
+
+-- Kick the spring without changing where it settles (used for click "pops").
+function Spring:impulse(velocity)
+	self.velocity += velocity
+	self:wake()
+end
+
+function Spring:advance(dt)
+	local angular = self.frequency * 2 * math.pi
+	local damping = self.damping
+	local offset = self.value - self.target
+	local velocity = self.velocity
+	local decay = math.exp(-damping * angular * dt)
+
+	if damping == 1 then
+		self.value = (offset * (1 + angular * dt) + velocity * dt) * decay + self.target
+		self.velocity = (velocity * (1 - angular * dt) - offset * (angular * angular * dt)) * decay
+	elseif damping < 1 then
+		local c = math.sqrt(1 - damping * damping)
+		local i = math.cos(angular * c * dt)
+		local j = math.sin(angular * c * dt)
+		local z = j / c
+		self.value = (offset * (i + damping * z) + velocity * z / angular) * decay + self.target
+		self.velocity = (velocity * (i - z * damping) - offset * (z * angular)) * decay
+	else
+		local c = math.sqrt(damping * damping - 1)
+		local r1 = -angular * (damping - c)
+		local r2 = -angular * (damping + c)
+		local co2 = (velocity - offset * r1) / (2 * angular * c)
+		local co1 = offset - co2
+		local e1 = co1 * math.exp(r1 * dt)
+		local e2 = co2 * math.exp(r2 * dt)
+		self.value = e1 + e2 + self.target
+		self.velocity = e1 * r1 + e2 * r2
+	end
+end
+
+-- Advance every moving spring. Springs that have settled are snapped exactly
+-- onto their target and dropped from the active list, so an idle interface
+-- costs nothing here.
+function Motion.step(dt)
+	local active = Motion.active
+	local index = 1
+	while index <= #active do
+		local spring = active[index]
+		spring:advance(dt)
+		local scale = math.max(1, math.abs(spring.target))
+		if math.abs(spring.value - spring.target) < 0.0005 * scale and math.abs(spring.velocity) < 0.005 * scale then
+			spring.value = spring.target
+			spring.velocity = 0
+			spring.running = false
+			active[index] = active[#active]
+			active[#active] = nil
+		else
+			index += 1
+		end
+		if spring.onStep then
+			spring.onStep(spring.value)
+		end
+	end
+end
+
+--------------------------------------------------------------------------------
+-- 6. RENDERER DETECTION  (Future Is Bright handling)
+--
+--    Three sources, in order of trust:
+--      a) Lighting.Technology     - exact, but read access is security-gated on
+--                                   current engine versions, so it may throw.
+--      b) Lighting.LightingStyle  - Realistic == the Future pipeline, Soft ==
+--         + PrioritizeLightingQuality  shadow maps (true) or voxels (false).
+--      c) nothing readable        - assume shadow maps: the safe middle.
+--
+--    On top of that sits the player's graphics quality level. A place can be
+--    authored for Future and still render without local-light shadows when the
+--    player has the quality slider low, so capabilities are the intersection
+--    of "what the place asked for" and "what this client is drawing".
+--------------------------------------------------------------------------------
+
+local Renderer = {
+	technology = "Unknown", -- "Future" | "ShadowMap" | "Voxel" | "Compatibility" | "Unknown"
+	source = "none",
+	futureClass = false, -- per-pixel local lights, shadows from local lights
+	shadowMaps = false, -- sun shadow maps (ShadowMap or Future)
+	quality = 0, -- 0 = Automatic, 1..10 = manual level
+	requested = false, -- true when we switched the place to Realistic
+	original = {},
+	listeners = {},
+}
+
+-- What the rest of the script actually asks about.
+local Caps = {
+	localLightShadows = false,
+	softShadows = false,
+	editableImage = false, -- set by the overlay once it has tried the API
+	-- True when Future lighting is NOT fully running. The "voxel ports" (fake
+	-- versions of Future-only features) unlock on this; under Future the real
+	-- thing exists and the fakes would only double up.
+	nonFuture = true,
+}
+
+function Renderer.qualityAllowsFuture()
+	return Renderer.quality == 0 or Renderer.quality >= CONFIG.MinQualityForFuture
+end
+
+function Renderer.detect()
+	local technology = readProperty(Lighting, "Technology")
+	local style = readProperty(Lighting, "LightingStyle")
+	local prioritise = readProperty(Lighting, "PrioritizeLightingQuality")
+
+	local styleName = typeof(style) == "EnumItem" and style.Name or nil
+	local name = "Unknown"
+	local source = "none"
+
+	if typeof(technology) == "EnumItem" then
+		name = technology.Name
+		source = "Technology"
+	end
+
+	-- "Unified" is the merged pipeline: what it draws is decided by the style.
+	-- The same mapping covers the case where Technology was not readable.
+	if name == "Unknown" or name == "Unified" then
+		if styleName == "Realistic" then
+			name = "Future"
+			source = "LightingStyle"
+		elseif styleName == "Soft" then
+			name = prioritise == true and "ShadowMap" or "Voxel"
+			source = "LightingStyle"
+		elseif name == "Unified" then
+			name = "Future"
+		end
+	end
+
+	if name == "Legacy" then
+		name = "Compatibility"
+	end
+
+	-- Graphics quality level chosen by the player (Automatic reports 0).
+	local quality = 0
+	pcall(function()
+		local gameSettings = UserSettings():GetService("UserGameSettings")
+		quality = gameSettings.SavedQualityLevel.Value
+	end)
+
+	Renderer.technology = name
+	Renderer.source = source
+	Renderer.quality = quality
+	Renderer.futureClass = name == "Future"
+	Renderer.shadowMaps = name == "Future" or name == "ShadowMap" or name == "Unknown"
+
+	Caps.localLightShadows = Renderer.futureClass and Renderer.qualityAllowsFuture()
+	Caps.softShadows = Renderer.shadowMaps
+	Caps.nonFuture = not Caps.localLightShadows
+
+	for _, listener in Renderer.listeners do
+		task.spawn(listener)
+	end
+end
+
+-- Ask for the Realistic style. Returns quietly if the engine refuses.
+function Renderer.request()
+	if not CONFIG.RequestRealisticLighting or Renderer.futureClass or Renderer.requested then
+		return
+	end
+	local style = readProperty(Lighting, "LightingStyle")
+	local prioritise = readProperty(Lighting, "PrioritizeLightingQuality")
+	local ok = pcall(function()
+		(Lighting :: any).LightingStyle = (Enum :: any).LightingStyle.Realistic;
+		(Lighting :: any).PrioritizeLightingQuality = true
+	end)
+	if ok then
+		Renderer.requested = true
+		Renderer.original.LightingStyle = style
+		Renderer.original.PrioritizeLightingQuality = prioritise
+		Renderer.detect()
+	end
+end
+
+-- Hand the lighting style back exactly as the place had it.
+function Renderer.release()
+	if not Renderer.requested then
+		return
+	end
+	Renderer.requested = false
+	for property, value in Renderer.original do
+		writeProperty(Lighting, property, value)
+	end
+	table.clear(Renderer.original)
+	Renderer.detect()
+end
+
+function Renderer.onChange(listener)
+	table.insert(Renderer.listeners, listener)
+end
+
+-- One short line for the chip in the panel header, e.g. "Future · Q8".
+function Renderer.describe()
+	local quality = Renderer.quality == 0 and "Auto" or ("Q" .. Renderer.quality)
+	return Renderer.technology .. " · " .. quality
+end
+
+do
+	Renderer.detect()
+	-- Re-detect when the place or the player changes anything relevant. The
+	-- signal lookups are wrapped because gated properties may refuse to expose
+	-- a change signal as well.
+	for _, property in { "Technology", "LightingStyle", "PrioritizeLightingQuality" } do
+		pcall(function()
+			Lighting:GetPropertyChangedSignal(property):Connect(Renderer.detect)
+		end)
+	end
+	pcall(function()
+		local gameSettings = UserSettings():GetService("UserGameSettings")
+		gameSettings:GetPropertyChangedSignal("SavedQualityLevel"):Connect(Renderer.detect)
+	end)
+end
+
+--------------------------------------------------------------------------------
+-- 7. SETTINGS SCHEMA & STORE
+--
+--    One declarative table describes every setting: its control type, range,
+--    default, load score and any conditions. Both the simulation and the
+--    interface are generated from it, so adding a setting is a one-line change
+--    here plus wherever the simulation should read it.
+--
+--    Every tab is split into sections, which the interface shows as a row of
+--    sub-tabs under the header (a tab inside a tab). Sections only group rows;
+--    ids stay "tab.key", so moving a row between sections changes nothing else.
+--
+--    Kinds
+--      toggle   boolean
+--      slider   number in [min, max], snapped to `step`
+--      choice   index into `options` (a look, not a cost)
+--      tier     index into `options`, each with a load score in `loads`;
+--               this is the "tiers of detail" control the governor can lower
+--      group    a heading inside a section (no value)
+--
+--    Optional fields
+--      hint         one line of help under the name
+--      load         load score while a toggle is on / a slider is above min
+--      requires     key into Caps; the row locks when the capability is false
+--      requiresTag  text of the lock badge
+--      enabledWhen  function() -> boolean; the row dims when false
+--      active       function() -> boolean; load only counts while true
+--      profile      tier index for the Low / Medium / High / Ultra profiles
+--      format       how a slider value is printed
+--      onSet        function(value) run after the player changes the value
+--------------------------------------------------------------------------------
+
+local Settings: { [string]: any } = {
+	values = {},
+	items = {}, -- id -> item
+	listeners = {},
+	enabled = CONFIG.StartEnabled,
+	adaptive = true,
+	governor = 0, -- how many steps the Adaptive governor is holding tiers down
+	profile = 3, -- 1..4, or nil once the player customises a tier
+	applyingPreset = false,
+	saveQueued = false,
+}
+
+local function get(id)
+	return Settings.values[id]
+end
+
+-- Schema constructors. `extra` carries the optional fields listed above.
+local function withExtra(item, extra)
+	if extra then
+		for key, value in extra do
+			item[key] = value
+		end
+	end
+	return item
+end
+
+local function Group(title)
+	return { kind = "group", name = title }
+end
+
+local function Toggle(key, name, default, extra)
+	return withExtra({ kind = "toggle", key = key, name = name, default = default }, extra)
+end
+
+local function Slider(key, name, min, max, step, default, extra)
+	return withExtra({ kind = "slider", key = key, name = name, min = min, max = max, step = step, default = default }, extra)
+end
+
+local function Choice(key, name, options, default, extra)
+	return withExtra({ kind = "choice", key = key, name = name, options = options, default = default }, extra)
+end
+
+local function Tier(key, name, options, loads, default, extra)
+	return withExtra({ kind = "tier", key = key, name = name, options = options, loads = loads, default = default }, extra)
+end
+
+-- Conditions reused by several rows. Each returns a function so the schema
+-- below stays declarative.
+local function whenWeather()
+	return get("world.weather") > 1
+end
+
+local function whenOn(id)
+	return function()
+		return get(id) == true
+	end
+end
+
+local function whenAbove(id, threshold)
+	return function()
+		return get(id) > threshold
+	end
+end
+
+local function whenEquals(id, value)
+	return function()
+		return get(id) == value
+	end
+end
+
+local function whenAll(...)
+	local conditions = { ... }
+	return function()
+		for _, condition in conditions do
+			if not condition() then
+				return false
+			end
+		end
+		return true
+	end
+end
+
+--------------------------------------------------------------------------------
+-- Colour grading presets (Camera > Grading).
+--
+-- The grading section works like Lightroom's Develop panel: Light (exposure,
+-- contrast, highlights, shadows, whites, blacks), Presence (clarity, dehaze,
+-- vibrance, saturation), White balance (temperature, tint) and three colour
+-- wheels (shadows, midtones, highlights). Presets write all of those at once,
+-- and touching any of them afterwards turns the preset into "Custom".
+--
+-- Several presets are modelled on popular ReShade / RoShade looks (Technicolor,
+-- bleach bypass, the punchy "Rich" look RoShade presets were known for).
+--------------------------------------------------------------------------------
+
+local GRADE_KEYS = {
+	"exposureBias",
+	"contrast",
+	"highlights",
+	"shadows",
+	"whites",
+	"blacks",
+	"clarity",
+	"dehaze",
+	"vibrance",
+	"saturation",
+	"temperature",
+	"tint",
+	"shadowHue",
+	"shadowAmount",
+	"midHue",
+	"midAmount",
+	"highlightHue",
+	"highlightAmount",
+}
+
+-- Values a preset leaves out fall back to these.
+local GRADE_NEUTRAL = {
+	exposureBias = 0,
+	contrast = 0,
+	highlights = 0,
+	shadows = 0,
+	whites = 0,
+	blacks = 0,
+	clarity = 0,
+	dehaze = 0,
+	vibrance = 0,
+	saturation = 0,
+	temperature = 0,
+	tint = 0,
+	shadowHue = 210,
+	shadowAmount = 0,
+	midHue = 30,
+	midAmount = 0,
+	highlightHue = 40,
+	highlightAmount = 0,
+}
+
+local GRADE_PRESETS = {
+	{ name = "Custom" },
+	{ name = "Neutral", values = {} },
+	{ name = "Natural", values = { contrast = 0.1, saturation = 0.08, temperature = 0.06 } },
+	{
+		name = "Vivid",
+		values = { contrast = 0.22, vibrance = 0.45, saturation = 0.12, clarity = 0.25, dehaze = 0.15, whites = 0.1, blacks = -0.1 },
+	},
+	{
+		name = "Cinematic",
+		values = {
+			contrast = 0.18,
+			saturation = -0.06,
+			blacks = 0.12,
+			temperature = 0.04,
+			shadowHue = 190,
+			shadowAmount = 0.45,
+			highlightHue = 32,
+			highlightAmount = 0.4,
+		},
+	},
+	{
+		name = "Golden hour",
+		values = {
+			contrast = 0.08,
+			shadows = 0.15,
+			vibrance = 0.2,
+			temperature = 0.45,
+			tint = 0.08,
+			highlightHue = 36,
+			highlightAmount = 0.5,
+		},
+	},
+	{
+		name = "Moody",
+		values = {
+			exposureBias = -0.3,
+			contrast = 0.25,
+			highlights = -0.25,
+			shadows = -0.2,
+			clarity = 0.2,
+			saturation = -0.25,
+			shadowHue = 215,
+			shadowAmount = 0.3,
+		},
+	},
+	{
+		name = "Faded film",
+		values = {
+			contrast = -0.15,
+			highlights = -0.15,
+			blacks = 0.35,
+			saturation = -0.15,
+			shadowHue = 200,
+			shadowAmount = 0.15,
+			midHue = 40,
+			midAmount = 0.15,
+		},
+	},
+	{
+		name = "Portra",
+		values = {
+			contrast = -0.05,
+			shadows = 0.2,
+			blacks = 0.1,
+			vibrance = 0.15,
+			saturation = -0.08,
+			temperature = 0.2,
+			tint = 0.05,
+			highlightHue = 30,
+			highlightAmount = 0.2,
+		},
+	},
+	{
+		name = "Velvia",
+		values = { contrast = 0.25, blacks = -0.15, dehaze = 0.2, vibrance = 0.3, saturation = 0.35, tint = -0.05 },
+	},
+	{
+		name = "Technicolor",
+		values = {
+			contrast = 0.2,
+			saturation = 0.3,
+			temperature = 0.1,
+			shadowHue = 180,
+			shadowAmount = 0.2,
+			midHue = 15,
+			midAmount = 0.12,
+		},
+	},
+	{
+		name = "Bleach bypass",
+		values = { contrast = 0.4, whites = 0.15, blacks = -0.1, clarity = 0.35, saturation = -0.55 },
+	},
+	{
+		name = "Cross process",
+		values = {
+			contrast = 0.25,
+			saturation = 0.15,
+			tint = -0.1,
+			shadowHue = 230,
+			shadowAmount = 0.5,
+			highlightHue = 60,
+			highlightAmount = 0.45,
+		},
+	},
+	{
+		name = "Arctic",
+		values = {
+			highlights = 0.1,
+			dehaze = -0.1,
+			saturation = -0.2,
+			temperature = -0.5,
+			shadowHue = 205,
+			shadowAmount = 0.3,
+		},
+	},
+	{
+		name = "Pastel",
+		values = {
+			exposureBias = 0.15,
+			contrast = -0.2,
+			highlights = -0.1,
+			whites = 0.15,
+			blacks = 0.25,
+			vibrance = 0.25,
+			saturation = -0.1,
+		},
+	},
+	{
+		name = "Rich",
+		values = {
+			contrast = 0.3,
+			highlights = -0.15,
+			shadows = 0.15,
+			clarity = 0.4,
+			dehaze = 0.3,
+			vibrance = 0.55,
+			saturation = 0.15,
+		},
+	},
+	{ name = "Noir", values = { contrast = 0.35, blacks = -0.15, clarity = 0.4, saturation = -1 } },
+}
+
+local GRADE_PRESET_NAMES = {}
+for index, preset in GRADE_PRESETS do
+	GRADE_PRESET_NAMES[index] = preset.name
+end
+local GRADE_DEFAULT_PRESET = 3 -- Natural
+
+local function applyGradePreset(index)
+	local preset = GRADE_PRESETS[index]
+	if not preset or not preset.values then
+		return
+	end
+	Settings.applyingPreset = true
+	for _, key in GRADE_KEYS do
+		local value = preset.values[key]
+		if value == nil then
+			value = GRADE_NEUTRAL[key]
+		end
+		Settings.set("cam." .. key, value)
+	end
+	Settings.applyingPreset = false
+end
+
+-- Any manual change to a grading value detaches the look from its preset.
+local function gradeEdited()
+	if not Settings.applyingPreset and get("cam.gradePreset") ~= 1 then
+		Settings.set("cam.gradePreset", 1)
+	end
+end
+
+-- Grading slider: -1..1 unless told otherwise, flagged so edits mark the
+-- preset as Custom. Defaults come from the default preset.
+local function Grade(key, name, extra)
+	local defaults = GRADE_PRESETS[GRADE_DEFAULT_PRESET].values
+	local default = defaults[key]
+	if default == nil then
+		default = GRADE_NEUTRAL[key]
+	end
+	local item = Slider(key, name, -1, 1, 0.01, default, { format = "signed", onSet = gradeEdited })
+	return withExtra(item, extra)
+end
+
+local function whenDof(minimum)
+	return function()
+		return get("cam.dof") >= minimum
+	end
+end
+
+local function whenAdaptiveFocus()
+	return get("cam.dof") >= 3 and get("cam.focusMode") == 2
+end
+
+local function whenStaticFocus()
+	return get("cam.dof") >= 3 and get("cam.focusMode") == 1
+end
+
+local function whenWater()
+	return get("mat.water") > 1
+end
+
+local TABS = {
+	----------------------------------------------------------------------------
+	{
+		id = "atmo",
+		title = "Atmosphere",
+		blurb = "Light, fog and the sky above",
+		sections = {
+			{
+				id = "light",
+				title = "Light",
+				items = {
+					Choice("style", "Visual style", { "Unbound", "Reimagined" }, 1, {
+						hint = "Unbound grades for realism, Reimagined stays brighter",
+					}),
+					Toggle("dynamic", "Dynamic lighting", true, {
+						hint = "Sun, moon and ambient colour follow the clock",
+					}),
+					Choice("clock", "Clock source", { "Game", "Fixed", "Cycle" }, 1),
+					Slider("time", "Fixed time", 0, 24, 0.25, 14, {
+						format = "clock",
+						enabledWhen = whenEquals("atmo.clock", 2),
+					}),
+					Slider("dayLength", "Day length", 2, 60, 1, 20, {
+						format = "minutes",
+						enabledWhen = whenEquals("atmo.clock", 3),
+					}),
+					Slider("nightLight", "Night brightness", 0, 1, 0.01, 0.4),
+					Toggle("cloudShadows", "Cloud shadows", true, {
+						hint = "Passing clouds dim the sunlight",
+						enabledWhen = whenAll(whenOn("atmo.clouds"), whenOn("atmo.dynamic")),
+					}),
+				},
+			},
+			{
+				id = "air",
+				title = "Air",
+				items = {
+					Slider("fog", "Atmospheric fog", 0, 1, 0.01, 0.35),
+					Slider("haze", "Distance haze", 0, 1, 0.01, 0.3),
+					Slider("shafts", "Light shafts", 0, 1, 0.01, 0.45, { load = 1 }),
+					Toggle("morningMist", "Morning mist", true, {
+						hint = "Low fog that burns off after sunrise",
+					}),
+					Toggle("caveFog", "Cave fog", true, {
+						hint = "Enclosed spaces fade into darkness",
+					}),
+				},
+			},
+			{
+				id = "sky",
+				title = "Sky",
+				items = {
+					Group("Clouds"),
+					Toggle("clouds", "Volumetric clouds", true, { load = 2 }),
+					Slider("cloudCover", "Cloud cover", 0, 1, 0.01, 0.5, {
+						enabledWhen = whenOn("atmo.clouds"),
+					}),
+					Group("Night sky"),
+					Slider("stars", "Star density", 0, 1, 0.01, 0.6, {
+						hint = "Stars fade in one by one through dusk",
+					}),
+					Slider("milkyWay", "Milky Way", 0, 1, 0.01, 0.35, {
+						hint = "A faint galactic band across clear nights",
+					}),
+					Group("Shooting stars"),
+					Toggle("meteors", "Shooting stars", true),
+					Slider("meteorRate", "Frequency", 1, 60, 1, 6, {
+						format = "perMinute",
+						enabledWhen = whenOn("atmo.meteors"),
+					}),
+					Toggle("meteorShower", "Meteor shower", false, {
+						hint = "Streaks radiate from one point, four times as often",
+						enabledWhen = whenOn("atmo.meteors"),
+					}),
+					Slider("meteorSpeed", "Speed", 0.25, 2, 0.05, 1, {
+						format = "multiplier",
+						enabledWhen = whenOn("atmo.meteors"),
+					}),
+					Slider("meteorLength", "Trail length", 0.25, 2, 0.05, 1, {
+						format = "multiplier",
+						enabledWhen = whenOn("atmo.meteors"),
+					}),
+					Slider("meteorBrightness", "Brightness", 0, 1, 0.01, 0.7, {
+						enabledWhen = whenOn("atmo.meteors"),
+					}),
+					Choice("meteorColor", "Colour", { "White", "Emerald", "Gold", "Ice", "Rose" }, 1, {
+						enabledWhen = whenOn("atmo.meteors"),
+					}),
+				},
+			},
+			{
+				id = "aurora",
+				title = "Aurora",
+				items = {
+					Tier("aurora", "Aurora", { "Off", "Low", "High", "Ultra" }, { 0, 1, 2, 3 }, 3, {
+						hint = "Curtains of rays rippling across the whole sky",
+						profile = { 2, 2, 3, 4 },
+					}),
+					Choice("auroraWhen", "Appears", { "Always", "Clear", "Snowy" }, 2, {
+						hint = "Clear: cloudless skies. Snowy: snowfall or winter",
+						enabledWhen = whenAbove("atmo.aurora", 1),
+					}),
+					Toggle("auroraDay", "Daytime aurora", false, {
+						hint = "Keep the curtains visible in daylight",
+						enabledWhen = whenAbove("atmo.aurora", 1),
+					}),
+					Slider("auroraDayStrength", "Daytime strength", 0, 1, 0.01, 0.5, {
+						enabledWhen = whenAll(whenAbove("atmo.aurora", 1), whenOn("atmo.auroraDay")),
+					}),
+					Slider("auroraBrightness", "Brightness", 0, 1, 0.01, 0.6, {
+						enabledWhen = whenAbove("atmo.aurora", 1),
+					}),
+					Slider("auroraCoverage", "Sky coverage", 0, 1, 0.01, 0.8, {
+						hint = "From a band in the north to the whole sky",
+						enabledWhen = whenAbove("atmo.aurora", 1),
+					}),
+					Slider("auroraSpeed", "Activity", 0, 1, 0.01, 0.35, {
+						hint = "How fast the curtains fold and the rays flicker",
+						enabledWhen = whenAbove("atmo.aurora", 1),
+					}),
+					Choice("auroraPalette", "Colours", { "Classic", "Pink edge", "Crimson", "Violet", "Teal" }, 1, {
+						enabledWhen = whenAbove("atmo.aurora", 1),
+					}),
+					Toggle("auroraGlow", "Sky glow", true, {
+						hint = "The aurora tints the night's ambient light",
+						enabledWhen = whenAbove("atmo.aurora", 1),
+					}),
+				},
+			},
+		},
+	},
+	----------------------------------------------------------------------------
+	{
+		id = "world",
+		title = "World",
+		blurb = "Weather, seasons and living detail",
+		sections = {
+			{
+				id = "weather",
+				title = "Weather",
+				items = {
+					Choice("weather", "Weather", { "Clear", "Rain", "Storm", "Snow" }, 1),
+					Tier("density", "Precipitation", { "Low", "Med", "High", "Ultra" }, { 1, 2, 3, 4 }, 3, {
+						hint = "Particle count for rain and snow",
+						profile = { 1, 2, 3, 4 },
+						enabledWhen = whenWeather,
+						active = whenWeather,
+					}),
+					Slider("wind", "Wind", 0, 1, 0.01, 0.3, {
+						hint = "Drives clouds, terrain grass and particles",
+					}),
+					Toggle("lightning", "Lightning", true, {
+						enabledWhen = whenEquals("world.weather", 3),
+					}),
+					Toggle("lightningBolts", "Visible bolts", true, {
+						hint = "Forked bolts in the distance with each strike",
+						enabledWhen = whenAll(whenEquals("world.weather", 3), whenOn("world.lightning")),
+					}),
+					Toggle("rainbows", "Rainbows", true, {
+						hint = "Opposite the sun as the rain clears",
+					}),
+				},
+			},
+			{
+				id = "wet",
+				title = "Wet",
+				items = {
+					Toggle("wetness", "Rain wetness", true, {
+						hint = "Surfaces turn glossy while it rains",
+						load = 1,
+						active = function()
+							local weather = get("world.weather")
+							return weather == 2 or weather == 3
+						end,
+					}),
+					Tier("puddles", "Puddles", { "Off", "Few", "Some", "Many" }, { 0, 1, 2, 3 }, 3, {
+						hint = "Reflective pools gather on open ground",
+						profile = { 1, 2, 3, 4 },
+						enabledWhen = whenOn("world.wetness"),
+					}),
+					Toggle("ripples", "Raindrop ripples", true, {
+						enabledWhen = whenAll(whenOn("world.wetness"), whenAbove("world.puddles", 1)),
+					}),
+					Toggle("splashes", "Ground splashes", true, {
+						hint = "Drops bursting on the ground around you",
+						load = 1,
+						active = function()
+							local weather = get("world.weather")
+							return weather == 2 or weather == 3
+						end,
+					}),
+					Toggle("snowCover", "Snow cover", true, {
+						hint = "Grass and ground whiten as snow settles",
+					}),
+				},
+			},
+			{
+				id = "life",
+				title = "Life",
+				items = {
+					Tier("motes", "Ambient particles", { "Off", "Few", "Some", "Many" }, { 0, 1, 2, 3 }, 3, {
+						hint = "Fireflies at night, drifting dust by day",
+						profile = { 2, 2, 3, 4 },
+					}),
+					Choice("season", "Season", { "Off", "Spring", "Summer", "Autumn", "Winter" }, 1, {
+						hint = "Tints the grade and recolours terrain grass",
+					}),
+				},
+			},
+			{
+				id = "sun",
+				title = "Sun",
+				items = {
+					Toggle("sunOverride", "Custom sun path", false),
+					Slider("sunTilt", "Sun path tilt", 0, 80, 1, 42, {
+						format = "degrees",
+						enabledWhen = whenOn("world.sunOverride"),
+					}),
+					Slider("shadowSoftness", "Shadow softness", 0, 1, 0.01, 0.25, {
+						requires = "softShadows",
+						requiresTag = "SHADOW MAPS",
+					}),
+				},
+			},
+		},
+	},
+	----------------------------------------------------------------------------
+	{
+		id = "mat",
+		title = "Materials",
+		blurb = "Reflections, light sources and water",
+		sections = {
+			{
+				id = "surfaces",
+				title = "Surfaces",
+				items = {
+					Slider("specular", "Sky reflections", 0, 1, 0.01, 0.85, {
+						hint = "Environment reflections on smooth and metal surfaces",
+						load = 1,
+					}),
+					Slider("diffuse", "Sky ambient", 0, 1, 0.01, 0.6, {
+						hint = "Ambient light sampled from the skybox",
+					}),
+					Tier("reflect", "Material reflections", { "Off", "Near", "Wide", "Far" }, { 0, 1, 2, 3 }, 3, {
+						hint = "Every material gets a fitting sheen",
+						profile = { 1, 2, 3, 4 },
+					}),
+					Slider("reflectAmount", "Sheen", 0, 1, 0.01, 0.5, {
+						enabledWhen = whenAbove("mat.reflect", 1),
+					}),
+					Slider("wetSheen", "Wet sheen", 0, 1, 0.01, 0.6, {
+						hint = "Extra gloss on surfaces open to the rain",
+						enabledWhen = whenAll(whenAbove("mat.reflect", 1), whenOn("world.wetness")),
+					}),
+				},
+			},
+			{
+				id = "lights",
+				title = "Lights",
+				items = {
+					Tier("lightShadows", "Light shadows", { "Off", "Near", "Wide", "All" }, { 0, 2, 3, 4 }, 2, {
+						hint = "Shadows cast by lamps, torches and screens",
+						profile = { 1, 2, 2, 3 },
+						requires = "localLightShadows",
+						requiresTag = "FUTURE",
+					}),
+					Slider("shadowRange", "Shadow distance", 10, 250, 5, 120, {
+						hint = "Lights further away than this never cast shadows",
+						format = "studs",
+						requires = "localLightShadows",
+						requiresTag = "FUTURE",
+					}),
+					Slider("lightBoost", "Light intensity", 0.5, 2, 0.05, 1, { format = "multiplier" }),
+					Slider("lightFlicker", "Light flicker", 0, 1, 0.01, 0, {
+						hint = "Nearby lights waver like flame",
+						load = 1,
+					}),
+					Slider("lightWarmth", "Light colour", -1, 1, 0.02, 0, {
+						hint = "Cool (-) or warm (+) lamp light",
+						format = "signed",
+					}),
+				},
+			},
+			{
+				id = "ports",
+				title = "Voxel",
+				items = {
+					Group("Future effects, recreated"),
+					Tier("halos", "Light halos", { "Off", "Near", "Wide" }, { 0, 1, 2 }, 2, {
+						hint = "Soft glow around lamps, like HDR bloom",
+						profile = { 1, 2, 2, 3 },
+					}),
+					Slider("haloSize", "Halo size", 0, 1, 0.01, 0.5, {
+						enabledWhen = whenAbove("mat.halos", 1),
+					}),
+					Toggle("contactShadows", "Contact shadows", true, {
+						hint = "Soft shadows under characters",
+						load = 1,
+						requires = "nonFuture",
+						requiresTag = "NATIVE IN FUTURE",
+					}),
+					Slider("contactStrength", "Shadow strength", 0, 1, 0.01, 0.6, {
+						requires = "nonFuture",
+						requiresTag = "NATIVE IN FUTURE",
+						enabledWhen = whenOn("mat.contactShadows"),
+					}),
+				},
+			},
+			{
+				id = "water",
+				title = "Water",
+				items = {
+					Choice("water", "Water style", { "Game", "Tropical", "Lagoon", "Deep", "Arctic", "Murky" }, 1, {
+						hint = "Game leaves terrain water exactly as authored",
+					}),
+					Slider("waterReflect", "Water reflections", 0, 1, 0.01, 0.8, { enabledWhen = whenWater }),
+					Slider("waterClarity", "Water clarity", 0, 1, 0.01, 0.55, { enabledWhen = whenWater }),
+					Slider("waveSize", "Wave height", 0, 1, 0.01, 0.2, { enabledWhen = whenWater }),
+					Slider("waveSpeed", "Wave speed", 0, 1, 0.01, 0.3, { enabledWhen = whenWater }),
+					Group("Underwater"),
+					Toggle("underwater", "Underwater effects", true, {
+						hint = "Fog, colour shift and lens warp below the surface",
+					}),
+					Slider("underwaterFog", "Water fog", 0, 1, 0.01, 0.6, {
+						enabledWhen = whenOn("mat.underwater"),
+					}),
+					Slider("underwaterWarp", "Lens warp", 0, 1, 0.01, 0.5, {
+						enabledWhen = whenOn("mat.underwater"),
+					}),
+					Slider("muffle", "Muffled audio", 0, 1, 0.01, 0.7, {
+						hint = "Sounds lose their highs below the surface",
+						enabledWhen = whenOn("mat.underwater"),
+					}),
+					Toggle("bubbles", "Bubbles", true, {
+						enabledWhen = whenOn("mat.underwater"),
+					}),
+				},
+			},
+		},
+	},
+	----------------------------------------------------------------------------
+	{
+		id = "cam",
+		title = "Camera",
+		blurb = "Lens, focus, exposure and colour",
+		sections = {
+			{
+				id = "lens",
+				title = "Lens",
+				items = {
+					Tier("bloom", "Bloom", { "Off", "Soft", "Full", "Wide" }, { 0, 1, 2, 3 }, 3, {
+						profile = { 2, 3, 3, 4 },
+					}),
+					Slider("bloomStrength", "Bloom strength", 0, 1, 0.01, 0.5, {
+						enabledWhen = whenAbove("cam.bloom", 1),
+					}),
+					Slider("bloomThreshold", "Bloom threshold", 0.8, 2.5, 0.05, 1.65, {
+						hint = "Brightness a pixel needs before it glows",
+						format = "decimal",
+						enabledWhen = whenAbove("cam.bloom", 1),
+					}),
+					Toggle("flare", "Lens flare", true, { load = 1 }),
+					Slider("flareStrength", "Flare strength", 0, 1, 0.01, 0.5, {
+						enabledWhen = whenOn("cam.flare"),
+					}),
+					Group("Motion"),
+					Slider("motionBlur", "Motion blur", 0, 1, 0.01, 0.25, { load = 1 }),
+					Slider("motionThreshold", "Blur threshold", 0, 180, 5, 30, {
+						hint = "How fast the camera must turn before it blurs",
+						format = "degPerSec",
+						enabledWhen = whenAbove("cam.motionBlur", 0),
+					}),
+				},
+			},
+			{
+				id = "focus",
+				title = "Focus",
+				items = {
+					Tier("dof", "Depth of field", { "Off", "Far", "Lens", "Cine" }, { 0, 1, 3, 4 }, 1, {
+						hint = "Far blurs the distance; Lens and Cine focus a subject",
+					}),
+					Slider("dofStrength", "Blur amount", 0, 1, 0.01, 0.5, {
+						enabledWhen = whenDof(2),
+					}),
+					Choice("focusMode", "Focus mode", { "Static", "Adaptive" }, 2, {
+						hint = "Static holds one distance; Adaptive pulls focus",
+						enabledWhen = whenDof(3),
+					}),
+					Slider("focusDistance", "Focus distance", 1, 200, 1, 30, {
+						format = "studs",
+						enabledWhen = whenStaticFocus,
+					}),
+					Choice("focusTarget", "Focus on", { "Centre", "Subject" }, 1, {
+						hint = "Subject tracks your character in third person",
+						enabledWhen = whenAdaptiveFocus,
+					}),
+					Slider("focusSpeed", "Focus pull time", 0.1, 3, 0.05, 0.6, {
+						format = "seconds",
+						enabledWhen = whenAdaptiveFocus,
+					}),
+					Slider("focusDelay", "Refocus delay", 0, 1, 0.05, 0.15, {
+						hint = "How long a new subject must hold before focus moves",
+						format = "seconds",
+						enabledWhen = whenAdaptiveFocus,
+					}),
+					Slider("focusThreshold", "Refocus threshold", 0, 0.5, 0.01, 0.1, {
+						hint = "Distance change ignored by the autofocus",
+						format = "fraction",
+						enabledWhen = whenAdaptiveFocus,
+					}),
+					Toggle("focusBreathing", "Focus breathing", false, {
+						hint = "Framing shifts slightly as focus moves",
+						enabledWhen = whenDof(3),
+					}),
+				},
+			},
+			{
+				id = "exposure",
+				title = "Exposure",
+				items = {
+					Tier("exposure", "Auto exposure", { "Off", "Basic", "Full" }, { 0, 1, 2 }, 3, {
+						hint = "Eyes adapt between indoors and daylight",
+						profile = { 2, 2, 3, 3 },
+					}),
+					Slider("exposureSpeed", "Adaptation speed", 0.25, 3, 0.05, 1, {
+						format = "multiplier",
+						enabledWhen = whenAbove("cam.exposure", 1),
+					}),
+					Slider("exposureRange", "Adaptation range", 0.25, 2, 0.05, 0.85, {
+						hint = "Largest correction the eye will make",
+						format = "evRange",
+						enabledWhen = whenAbove("cam.exposure", 1),
+					}),
+					Choice("tonemap", "Tone mapping", { "Filmic", "Retro" }, 1),
+				},
+			},
+			{
+				id = "grade",
+				title = "Grading",
+				items = {
+					Choice("gradePreset", "Preset", GRADE_PRESET_NAMES, GRADE_DEFAULT_PRESET, {
+						hint = "Editing any value below switches to Custom",
+						onSet = applyGradePreset,
+					}),
+					Group("Light"),
+					Slider("exposureBias", "Exposure", -2, 2, 0.05, 0, { format = "ev", onSet = gradeEdited }),
+					Grade("contrast", "Contrast"),
+					Grade("highlights", "Highlights", { hint = "Sunlit surfaces and bright sky" }),
+					Grade("shadows", "Shadows", { hint = "Areas lit only by the sky" }),
+					Grade("whites", "Whites"),
+					Grade("blacks", "Blacks"),
+					Group("Presence"),
+					Grade("clarity", "Clarity"),
+					Grade("dehaze", "Dehaze", { hint = "Thins or thickens the atmosphere" }),
+					Grade("vibrance", "Vibrance", { hint = "Boosts muted colours more than vivid ones" }),
+					Grade("saturation", "Saturation"),
+					Group("White balance"),
+					Grade("temperature", "Temperature"),
+					Grade("tint", "Tint", { hint = "Green (-) to magenta (+)" }),
+					Group("Colour grading"),
+					Slider("shadowHue", "Shadows hue", 0, 360, 5, GRADE_NEUTRAL.shadowHue, { format = "hue", onSet = gradeEdited }),
+					Slider("shadowAmount", "Shadows tint", 0, 1, 0.01, 0, { onSet = gradeEdited }),
+					Slider("midHue", "Midtones hue", 0, 360, 5, GRADE_NEUTRAL.midHue, { format = "hue", onSet = gradeEdited }),
+					Slider("midAmount", "Midtones tint", 0, 1, 0.01, 0, { onSet = gradeEdited }),
+					Slider("highlightHue", "Highlights hue", 0, 360, 5, GRADE_NEUTRAL.highlightHue, {
+						format = "hue",
+						onSet = gradeEdited,
+					}),
+					Slider("highlightAmount", "Highlights tint", 0, 1, 0.01, 0, { onSet = gradeEdited }),
+				},
+			},
+			{
+				id = "film",
+				title = "Film",
+				items = {
+					Slider("vignette", "Vignette", 0, 1, 0.01, 0.3),
+					Slider("grain", "Film grain", 0, 1, 0.01, 0, {
+						load = 1,
+						requires = "editableImage",
+						requiresTag = "IMAGE API",
+					}),
+					Toggle("lensDrops", "Lens droplets", true, {
+						hint = "Rain and water bead on the lens",
+					}),
+					Group("Speed"),
+					Slider("speedFov", "Speed FOV kick", 0, 20, 1, 6, { format = "degrees" }),
+					Slider("speedThreshold", "Kick threshold", 0, 100, 1, 18, {
+						hint = "Speed at which the field of view starts to widen",
+						format = "speed",
+						enabledWhen = whenAbove("cam.speedFov", 0),
+					}),
+					Slider("speedRange", "Full kick after", 5, 150, 1, 50, {
+						hint = "Extra speed needed for the whole kick",
+						format = "speed",
+						enabledWhen = whenAbove("cam.speedFov", 0),
+					}),
+				},
+			},
+		},
+	},
+	----------------------------------------------------------------------------
+	{
+		id = "fun",
+		title = "Fun",
+		blurb = "Filters, overlays and camera toys",
+		sections = {
+			{
+				id = "filters",
+				title = "Filters",
+				items = {
+					Choice("filter", "Filter", { "None", "Noir", "Sepia", "Dream", "Vapor", "Night vision", "Frostbite", "Inferno" }, 1),
+					Slider("filterStrength", "Filter strength", 0, 1, 0.01, 1, {
+						enabledWhen = whenAbove("fun.filter", 1),
+					}),
+					Toggle("hueCycle", "Hue cycle", false, { hint = "The whole image drifts through the rainbow" }),
+					Slider("hueSpeed", "Hue speed", 0.05, 1, 0.01, 0.25, {
+						enabledWhen = whenOn("fun.hueCycle"),
+					}),
+				},
+			},
+			{
+				id = "toys",
+				title = "Camera",
+				items = {
+					Toggle("tiltShift", "Tilt-shift", false, {
+						hint = "Miniature-world blur around your character",
+						load = 2,
+					}),
+					Toggle("letterbox", "Cinematic bars", false),
+					Choice("letterboxRatio", "Aspect ratio", { "2.39:1", "2:1", "1.85:1" }, 1, {
+						enabledWhen = whenOn("fun.letterbox"),
+					}),
+					Slider("wobble", "Camera wobble", 0, 1, 0.01, 0, { hint = "A slow, seasick sway" }),
+					Group("Crosshair"),
+					Choice("crosshair", "Crosshair", { "Off", "Dot", "Cross", "Circle" }, 1),
+					Slider("crosshairSize", "Size", 0.5, 2, 0.05, 1, {
+						format = "multiplier",
+						enabledWhen = whenAbove("fun.crosshair", 1),
+					}),
+					Choice("crosshairColor", "Colour", { "White", "Green", "Red", "Cyan", "Yellow" }, 1, {
+						enabledWhen = whenAbove("fun.crosshair", 1),
+					}),
+				},
+			},
+			{
+				id = "skytoys",
+				title = "Sky",
+				items = {
+					Toggle("timelapse", "Time-lapse", false, { hint = "A full day every forty seconds" }),
+					Slider("celestial", "Sun and moon size", 0.5, 4, 0.05, 1, { format = "multiplier" }),
+				},
+			},
+		},
+	},
+}
+
+-- Flatten the schema: give every item a global id ("tab.key"), fill in the
+-- defaults, and derive a couple of facts the interface needs repeatedly.
+do
+	for _, tab in TABS do
+		for _, section in tab.sections do
+			for _, item in section.items do
+				if item.kind ~= "group" then
+					item.id = tab.id .. "." .. item.key
+					item.tab = tab.id
+					item.section = section.id
+					if item.kind == "tier" then
+						-- A tier whose first step costs nothing is an "Off" step.
+						item.firstIsOff = item.loads[1] == 0
+						if item.profile then
+							item.default = item.profile[Settings.profile]
+						end
+						item.maxLoad = math.max(table.unpack(item.loads))
+					else
+						item.maxLoad = item.load or 0
+					end
+					Settings.items[item.id] = item
+					Settings.values[item.id] = item.default
+				end
+			end
+		end
+	end
+end
+
+function Settings.onChange(listener)
+	table.insert(Settings.listeners, listener)
+end
+
+-- Settings outlive the script instance: they are kept as JSON on an attribute
+-- of the local player, so a respawn (or a restart of the shaders) picks up
+-- exactly where the player left off. Saves are batched to one per second.
+function Settings.save()
+	if not CONFIG.PersistSettings or Settings.saveQueued then
+		return
+	end
+	Settings.saveQueued = true
+	task.delay(1, function()
+		Settings.saveQueued = false
+		local ok, encoded = pcall(HttpService.JSONEncode, HttpService, {
+			values = Settings.values,
+			enabled = Settings.enabled,
+			adaptive = Settings.adaptive,
+			profile = Settings.profile or 0,
+		})
+		if ok then
+			localPlayer:SetAttribute(STATE_ATTRIBUTE, encoded)
+		end
+	end)
+end
+
+-- Values are validated against the schema so a stale save from an older
+-- version of the script can never feed the simulation something it does not
+-- understand.
+function Settings.load()
+	local encoded = localPlayer:GetAttribute(STATE_ATTRIBUTE)
+	if not CONFIG.PersistSettings or type(encoded) ~= "string" then
+		return
+	end
+	local ok, state = pcall(HttpService.JSONDecode, HttpService, encoded)
+	if not ok or type(state) ~= "table" or type(state.values) ~= "table" then
+		return
+	end
+	for id, value in state.values do
+		local item = Settings.items[id]
+		if item then
+			if item.kind == "toggle" and type(value) == "boolean" then
+				Settings.values[id] = value
+			elseif item.kind == "slider" and type(value) == "number" then
+				Settings.values[id] = math.clamp(value, item.min, item.max)
+			elseif (item.kind == "choice" or item.kind == "tier") and type(value) == "number" then
+				local index = math.floor(value)
+				if index >= 1 and index <= #item.options then
+					Settings.values[id] = index
+				end
+			end
+		end
+	end
+	if type(state.enabled) == "boolean" then
+		Settings.enabled = state.enabled
+	end
+	if type(state.adaptive) == "boolean" then
+		Settings.adaptive = state.adaptive
+	end
+	if type(state.profile) == "number" then
+		Settings.profile = (state.profile >= 1 and state.profile <= 4) and math.floor(state.profile) or nil
+	end
+end
+
+-- `id` is a setting id, or one of the pseudo ids "@enabled", "@adaptive",
+-- "@governor", "@profile" and "@all" for state that is not a schema item.
+function Settings.notify(id)
+	for _, listener in Settings.listeners do
+		listener(id)
+	end
+	if id ~= "@governor" then
+		Settings.save()
+	end
+end
+
+function Settings.set(id, value)
+	if Settings.values[id] == value then
+		return
+	end
+	Settings.values[id] = value
+	local item = Settings.items[id]
+	if item and item.kind == "tier" and item.profile and Settings.profile then
+		-- Touching a profiled tier by hand means the profile no longer applies.
+		Settings.profile = nil
+		Settings.notify("@profile")
+	end
+	if item and item.onSet then
+		item.onSet(value)
+	end
+	Settings.notify(id)
+end
+
+function Settings.setEnabled(enabled)
+	if Settings.enabled ~= enabled then
+		Settings.enabled = enabled
+		Settings.notify("@enabled")
+	end
+end
+
+function Settings.setAdaptive(adaptive)
+	if Settings.adaptive ~= adaptive then
+		Settings.adaptive = adaptive
+		Settings.notify("@adaptive")
+	end
+end
+
+function Settings.setGovernor(steps)
+	if Settings.governor ~= steps then
+		Settings.governor = steps
+		Settings.notify("@governor")
+	end
+end
+
+function Settings.isAvailable(item)
+	return item.requires == nil or Caps[item.requires] == true
+end
+
+function Settings.isEnabled(item)
+	if not Settings.isAvailable(item) then
+		return false
+	end
+	return item.enabledWhen == nil or item.enabledWhen() == true
+end
+
+-- The tier the simulation should actually use: the player's choice, lowered
+-- by however many steps the governor is holding. The governor never switches
+-- a feature off; it stops at the lowest step that still shows the effect.
+function Settings.tier(id)
+	local item = Settings.items[id]
+	local selected = Settings.values[id]
+	if not Settings.isAvailable(item) then
+		return 1
+	end
+	if Settings.governor == 0 then
+		return selected
+	end
+	local floor = item.firstIsOff and math.min(selected, 2) or 1
+	return math.max(floor, selected - Settings.governor)
+end
+
+function Settings.itemLoad(item)
+	if item.maxLoad == 0 or not Settings.isAvailable(item) then
+		return 0
+	end
+	if item.active and not item.active() then
+		return 0
+	end
+	local value = Settings.values[item.id]
+	if item.kind == "tier" then
+		return item.loads[Settings.tier(item.id)]
+	elseif item.kind == "toggle" then
+		return value and item.load or 0
+	elseif item.kind == "slider" then
+		return value > item.min and item.load or 0
+	end
+	return 0
+end
+
+function Settings.totalLoad()
+	local total = 0
+	for _, item in Settings.items do
+		total += Settings.itemLoad(item)
+	end
+	return total
+end
+
+function Settings.applyProfile(index)
+	Settings.profile = index
+	for id, item in Settings.items do
+		if item.kind == "tier" and item.profile then
+			Settings.values[id] = item.profile[index]
+		end
+	end
+	Settings.notify("@all")
+end
+
+function Settings.reset()
+	Settings.profile = 3
+	for id, item in Settings.items do
+		if item.kind == "tier" and item.profile then
+			Settings.values[id] = item.profile[3]
+		else
+			Settings.values[id] = item.default
+		end
+	end
+	Settings.notify("@all")
+end
+
+-- How a slider prints its value. The read-out is narrow, so every format
+-- stays within about seven characters.
+local function formatValue(item, value)
+	local format = item.format
+	if format == "clock" then
+		local minutes = math.floor(value * 60 + 0.5)
+		return string.format("%02d:%02d", math.floor(minutes / 60) % 24, minutes % 60)
+	elseif format == "minutes" then
+		return string.format("%d min", math.floor(value + 0.5))
+	elseif format == "degrees" or format == "hue" then
+		return string.format("%d°", math.floor(value + 0.5))
+	elseif format == "multiplier" then
+		return string.format("%.2fx", value)
+	elseif format == "signed" then
+		return string.format("%+d", math.floor(value * 100 + 0.5))
+	elseif format == "studs" then
+		return string.format("%d st", math.floor(value + 0.5))
+	elseif format == "speed" then
+		return string.format("%d st/s", math.floor(value + 0.5))
+	elseif format == "perMinute" then
+		return string.format("%d/min", math.floor(value + 0.5))
+	elseif format == "seconds" then
+		return string.format("%.2fs", value)
+	elseif format == "degPerSec" then
+		return string.format("%d°/s", math.floor(value + 0.5))
+	elseif format == "ev" then
+		return string.format("%+.2f", value)
+	elseif format == "evRange" then
+		return string.format("%.1f EV", value)
+	elseif format == "decimal" then
+		return string.format("%.2f", value)
+	elseif format == "fraction" then
+		return string.format("%d%%", math.floor(value * 100 + 0.5))
+	end
+	local span = item.max - item.min
+	return string.format("%d%%", math.floor((value - item.min) / span * 100 + 0.5))
+end
+
+--------------------------------------------------------------------------------
+-- 8. BASELINE, SIMULATION STATE, LIGHTING AND SKY
+--------------------------------------------------------------------------------
+
+-- Baseline is the "leave no trace" bookkeeping. Before the simulation writes
+-- to anything that belongs to the place it records the original value here,
+-- and everything the simulation creates is listed so it can be destroyed.
+--
+-- The same originals are also written onto the instances themselves (an
+-- attribute per property plus a CollectionService tag), and everything we
+-- create or switch off is tagged. A copy of the script that dies without
+-- cleaning up (destroyed with the character, say) therefore leaves a full
+-- record behind, and the next copy puts the place back before it starts.
+local OWNED_ATTRIBUTE = "SolsticeOwned"
+local OWNED_TAG = "SolsticeOwned"
+local TOUCHED_TAG = "SolsticeTouched"
+local SUPPRESSED_TAG = "SolsticeSuppressed"
+local MARK_PREFIX = "Solstice_"
+
+local Baseline = {
+	lighting = {}, -- Lighting property -> original value
+	adopted = {}, -- instance -> { property -> original value }
+	created = {}, -- array of instances this script made
+	suppressed = {}, -- game post effects we switched off
+	terrainColors = {}, -- Enum.Material -> original terrain colour
+	wind = Vector3.zero,
+	active = false, -- true between capture and restore
+	connections = {},
+	cameraConnection = nil,
+}
+
+do
+	local LIGHTING_PROPERTIES = {
+		"Ambient",
+		"OutdoorAmbient",
+		"Brightness",
+		"ColorShift_Top",
+		"ColorShift_Bottom",
+		"EnvironmentDiffuseScale",
+		"EnvironmentSpecularScale",
+		"ExposureCompensation",
+		"ShadowSoftness",
+		"GeographicLatitude",
+		"ClockTime",
+	}
+
+	-- Record `value` as the original `property` of a place instance, on the
+	-- instance. If a mark already exists, an earlier copy recorded the true
+	-- original before changing it, so that value wins.
+	local function decodeMark(value)
+		if type(value) ~= "string" then
+			return value
+		end
+		local enumName, itemName = string.match(value, "^@Enum/([^/]+)/(.+)$")
+		if enumName then
+			local ok, item = pcall(function()
+				return ((Enum :: any)[enumName] :: any)[itemName]
+			end)
+			if ok then
+				return item
+			end
+		end
+		return value
+	end
+
+	function Baseline.mark(instance, property, value)
+		local name = MARK_PREFIX .. property
+		local existing = instance:GetAttribute(name)
+		if existing ~= nil then
+			return decodeMark(existing)
+		end
+		local stored = value
+		if typeof(value) == "EnumItem" then
+			local enumName, itemName = string.match(tostring(value), "^Enum%.([^%.]+)%.(.+)$")
+			if enumName then
+				stored = "@Enum/" .. enumName .. "/" .. itemName
+			end
+		end
+		if stored ~= nil and pcall(instance.SetAttribute, instance, name, stored) then
+			CollectionService:AddTag(instance, TOUCHED_TAG)
+		end
+		return value
+	end
+
+	local function clearMarks(instance, apply)
+		for name, value in instance:GetAttributes() do
+			if string.sub(name, 1, #MARK_PREFIX) == MARK_PREFIX then
+				if apply then
+					local property = string.sub(name, #MARK_PREFIX + 1)
+				if string.sub(property, 1, 9) == "Material_" and instance:IsA("Terrain") then
+					local ok, material = pcall(function()
+						return (Enum.Material :: any)[string.sub(property, 10)]
+					end)
+					if ok and material then
+						pcall(instance.SetMaterialColor, instance, material, decodeMark(value))
+					end
+				else
+					writeProperty(instance, property, decodeMark(value))
+				end
+			end
+		end
+				instance:SetAttribute(name, nil)
+		end
+		CollectionService:RemoveTag(instance, TOUCHED_TAG)
+	end
+
+	-- Undo whatever a dead copy left behind: destroy what it made, switch
+	-- the game's effects back on and write every recorded original back.
+	-- Runs once at boot, before anything else touches the place.
+	function Baseline.recover()
+		for _, instance in CollectionService:GetTagged(OWNED_TAG) do
+			pcall(instance.Destroy, instance)
+		end
+		for _, effect in CollectionService:GetTagged(SUPPRESSED_TAG) do
+			writeProperty(effect, "Enabled", true)
+			CollectionService:RemoveTag(effect, SUPPRESSED_TAG)
+		end
+		for _, instance in CollectionService:GetTagged(TOUCHED_TAG) do
+			clearMarks(instance, true)
+		end
+	end
+
+	function Baseline.capture()
+		table.clear(Baseline.lighting)
+		for _, property in LIGHTING_PROPERTIES do
+			Baseline.lighting[property] = Baseline.mark(Lighting, property, readProperty(Lighting, property))
+		end
+		Baseline.wind = Baseline.mark(Workspace, "GlobalWind", Workspace.GlobalWind)
+	end
+
+	-- Remember the current values of `properties` on an instance we did not
+	-- create, the first time we are about to change it.
+	function Baseline.adopt(instance, properties)
+		if Baseline.adopted[instance] then
+			return
+		end
+		local saved = {}
+		for _, property in properties do
+			saved[property] = Baseline.mark(instance, property, readProperty(instance, property))
+		end
+		Baseline.adopted[instance] = saved
+	end
+
+	function Baseline.restoreInstance(instance)
+		local saved = Baseline.adopted[instance]
+		if saved then
+			for property, value in saved do
+				writeProperty(instance, property, value)
+			end
+		end
+		forget(instance)
+	end
+
+	-- Hand some Lighting properties back to the place while still running.
+	function Baseline.releaseLighting(properties)
+		for _, property in properties do
+			local value = Baseline.lighting[property]
+			if value ~= nil then
+				writeProperty(Lighting, property, value)
+			end
+			forget(Lighting, property)
+		end
+	end
+
+	function Baseline.own(instance)
+		instance:SetAttribute(OWNED_ATTRIBUTE, true)
+		CollectionService:AddTag(instance, OWNED_TAG)
+		table.insert(Baseline.created, instance)
+		return instance
+	end
+
+	-- Atmosphere, Sky and Clouds are singletons: a second one is ignored or
+	-- fights the first. So reuse the place's instance when there is one
+	-- (recording its values), and only create our own when there is not.
+	function Baseline.acquire(parent, className, name, properties)
+		local existing = parent:FindFirstChildOfClass(className)
+		if existing and not existing:GetAttribute(OWNED_ATTRIBUTE) then
+			Baseline.adopt(existing, properties)
+			return existing
+		end
+		local made = Baseline.own(Instance.new(className))
+		made.Name = name
+		made.Parent = parent
+		return made
+	end
+
+	local function suppressEffect(effect)
+		-- Deferred calls can land after the shaders were switched off; by then
+		-- switching a game effect off would never be undone.
+		if not Baseline.active or not effect:IsA("PostEffect") or effect:GetAttribute(OWNED_ATTRIBUTE) then
+			return
+		end
+		if Baseline.suppressed[effect] == nil and effect.Enabled then
+			Baseline.suppressed[effect] = true
+			CollectionService:AddTag(effect, SUPPRESSED_TAG)
+			effect.Enabled = false
+		end
+	end
+
+	-- Effects parented to the camera only apply while that camera is current,
+	-- and some games replace the camera (often on respawn). So this runs again
+	-- whenever Workspace.CurrentCamera changes.
+	function Baseline.suppressCamera(camera)
+		if Baseline.cameraConnection then
+			Baseline.cameraConnection:Disconnect()
+			Baseline.cameraConnection = nil
+		end
+		if not CONFIG.SuppressGameEffects or not camera or not Baseline.active then
+			return
+		end
+		for _, child in camera:GetChildren() do
+			suppressEffect(child)
+		end
+		Baseline.cameraConnection = camera.ChildAdded:Connect(function(child)
+			task.defer(suppressEffect, child)
+		end)
+	end
+
+	function Baseline.suppress()
+		Baseline.active = true
+		if not CONFIG.SuppressGameEffects then
+			return
+		end
+		for _, child in Lighting:GetChildren() do
+			suppressEffect(child)
+		end
+		Baseline.suppressCamera(Workspace.CurrentCamera)
+		-- Effects the game adds later are caught too. Deferred by one step so
+		-- our own effects have their ownership attribute before the check.
+		table.insert(
+			Baseline.connections,
+			Lighting.ChildAdded:Connect(function(child)
+				task.defer(suppressEffect, child)
+			end)
+		)
+	end
+
+	function Baseline.restore()
+		Baseline.active = false
+		for _, connection in Baseline.connections do
+			connection:Disconnect()
+		end
+		table.clear(Baseline.connections)
+		if Baseline.cameraConnection then
+			Baseline.cameraConnection:Disconnect()
+			Baseline.cameraConnection = nil
+		end
+		for effect in Baseline.suppressed do
+			writeProperty(effect, "Enabled", true)
+			CollectionService:RemoveTag(effect, SUPPRESSED_TAG)
+		end
+		table.clear(Baseline.suppressed)
+
+		for instance in Baseline.adopted do
+			Baseline.restoreInstance(instance)
+		end
+		table.clear(Baseline.adopted)
+
+		for _, instance in Baseline.created do
+			instance:Destroy()
+		end
+		table.clear(Baseline.created)
+
+		for property, value in Baseline.lighting do
+			writeProperty(Lighting, property, value)
+		end
+		forget(Lighting)
+
+		writeProperty(Workspace, "GlobalWind", Baseline.wind)
+		forget(Workspace)
+
+		local terrain = Workspace:FindFirstChildOfClass("Terrain")
+		if terrain then
+			for material, color in Baseline.terrainColors do
+				pcall(terrain.SetMaterialColor, terrain, material, color)
+			end
+		end
+		table.clear(Baseline.terrainColors)
+
+		-- Everything is back as it was, so the crash records can go.
+		for _, instance in CollectionService:GetTagged(TOUCHED_TAG) do
+			clearMarks(instance, false)
+		end
+	end
+end
+Baseline.recover()
+-- Slow-moving simulation state. Everything in here is smoothed, so abrupt
+-- setting changes (switching weather, walking indoors) fade rather than pop.
+local sim = {
+	time = 0, -- seconds the simulation has been running
+	clock = 12, -- hours, 0..24
+	clockOwned = false,
+	rain = 0,
+	storm = 0,
+	snow = 0,
+	overcast = 0,
+	wet = 0,
+	rainMemory = 0, -- 1 while it rains, decays for a couple of minutes after
+	rainbow = 0,
+	snowCover = 0,
+	shelter = 0, -- 1 when there is a roof overhead
+	overheadOpen = true,
+	skyOpen = 1, -- fraction of sky probes that reached open sky
+	probeIndex = 0,
+	probeOpen = {},
+	cave = 0,
+	mist = 0,
+	cloudShade = 0,
+	stars = 0, -- star visibility, eased so stars fade instead of popping
+	aurora = 0, -- aurora visibility, eased
+	adapt = 0, -- auto exposure, in EV
+	flash = 0, -- lightning
+	nextStrike = 0,
+	restrike = nil,
+	strikeQueued = false,
+	underwater = 0, -- eased 0..1
+	submerged = false,
+	surfacedAt = -math.huge,
+	waterColor = rgb(40, 110, 140),
+	focus = 60, -- studs, what the lens is focused on right now
+	afCommitted = 60, -- the distance the autofocus last settled on
+	afCandidate = 60,
+	afCandidateSince = 0,
+	focusSpring = nil,
+	blur = 0,
+	lastLook = nil,
+	hue = 0,
+	fovKick = 0,
+	baseFov = 70,
+	lastFov = -1,
+	fovOwned = false,
+	tiltBase = nil,
+	tiltWritten = nil,
+	flare = 0,
+	flareOpen = false,
+	bars = 0,
+	rigOwned = false,
+	sunOwned = false,
+	waterOwned = false,
+	softOwned = false,
+	seasonApplied = 1,
+	coverApplied = 0,
+	timers = {},
+	rayParams = RaycastParams.new(),
+}
+sim.rayParams.FilterType = Enum.RaycastFilterType.Exclude
+sim.rayParams.IgnoreWater = true
+
+-- Per-frame context shared by every stage. One table, reused, so the frame
+-- loop allocates nothing.
+local F = {
+	camera = nil,
+	rawDt = 1 / 60, -- unclamped frame time
+	camPos = Vector3.zero,
+	look = Vector3.zAxis,
+	sun = Vector3.yAxis,
+	sunHeight = 1,
+	day = 1, -- 1 in full daylight, 0 at night
+	night = 0,
+	twilight = 0, -- peaks while the sun is near the horizon
+	wind = Vector3.zero,
+	filter = nil,
+	filterStrength = 0,
+	season = nil,
+	reimagined = false,
+	aurora = 0, -- how strongly the aurora lights the scene, 0..1
+	auroraColor = Color3.new(0.3, 1, 0.55),
+}
+
+-- Runs at most once per `interval` seconds; true on the frames it fires.
+-- The first call for a given name fires immediately.
+local function every(name, interval, dt)
+	local elapsed = (sim.timers[name] or interval) + dt
+	if elapsed >= interval then
+		sim.timers[name] = 0
+		return true
+	end
+	sim.timers[name] = elapsed
+	return false
+end
+
+-- Instances created by the engine (post effects) or acquired from the place.
+-- Filled by Engine.start and emptied by Engine.stop.
+local Fx: { [string]: any } = {}
+
+-- Look-up tables for the simulation.
+local Look = {
+	-- Colours are blended night -> day by `F.day`, then pulled towards the
+	-- "gold" entry while the sun is near the horizon.
+	palette = {
+		sunDay = rgb(72, 60, 42),
+		sunGold = rgb(255, 138, 58),
+		sunNight = rgb(44, 62, 120),
+		outdoorDay = rgb(118, 126, 140),
+		outdoorGold = rgb(128, 100, 98),
+		outdoorNight = rgb(30, 38, 62),
+		indoorDay = rgb(52, 54, 62),
+		indoorGold = rgb(50, 42, 44),
+		indoorNight = rgb(14, 17, 28),
+		airDay = rgb(198, 211, 228),
+		airGold = rgb(255, 196, 158),
+		airNight = rgb(20, 26, 46),
+		airStorm = rgb(128, 136, 148),
+		decayDay = rgb(108, 120, 142),
+		decayGold = rgb(255, 112, 62),
+		decayNight = rgb(8, 10, 22),
+		cloudDay = rgb(255, 255, 255),
+		cloudGold = rgb(255, 190, 150),
+		cloudNight = rgb(40, 48, 72),
+		cloudStorm = rgb(96, 102, 114),
+		overcastAmbient = rgb(112, 116, 124),
+	},
+
+	filters = {
+		{ name = "None" },
+		{ name = "Noir", saturation = -1, contrast = 0.25, brightness = -0.02, tint = rgb(255, 255, 255) },
+		{ name = "Sepia", saturation = -0.75, contrast = 0.08, brightness = 0.02, tint = rgb(255, 226, 180) },
+		{ name = "Dream", saturation = 0.25, contrast = -0.12, brightness = 0.06, tint = rgb(255, 232, 245), bloom = 0.6 },
+		{ name = "Vapor", saturation = 0.35, contrast = 0.1, brightness = 0, tint = rgb(255, 190, 245) },
+		{ name = "Night vision", saturation = -0.9, contrast = 0.3, brightness = 0.1, tint = rgb(120, 255, 130), exposure = 1.2 },
+		{ name = "Frostbite", saturation = -0.25, contrast = 0.12, brightness = 0, tint = rgb(190, 225, 255) },
+		{ name = "Inferno", saturation = 0.2, contrast = 0.22, brightness = 0, tint = rgb(255, 170, 120) },
+	},
+
+	seasons = {
+		{ name = "Off", tint = rgb(255, 255, 255), saturation = 0 },
+		{ name = "Spring", tint = rgb(246, 255, 244), saturation = 0.06, grass = rgb(104, 164, 78), leafy = rgb(96, 150, 70) },
+		{ name = "Summer", tint = rgb(255, 250, 236), saturation = 0.1, grass = rgb(112, 148, 58), leafy = rgb(98, 132, 52) },
+		{ name = "Autumn", tint = rgb(255, 238, 216), saturation = 0.04, grass = rgb(150, 128, 62), leafy = rgb(176, 104, 44) },
+		{ name = "Winter", tint = rgb(228, 238, 255), saturation = -0.14, grass = rgb(206, 214, 220), leafy = rgb(190, 200, 208) },
+	},
+
+	waters = {
+		{ name = "Game" },
+		{ name = "Tropical", color = rgb(38, 186, 196) },
+		{ name = "Lagoon", color = rgb(64, 198, 166) },
+		{ name = "Deep", color = rgb(14, 58, 108) },
+		{ name = "Arctic", color = rgb(148, 198, 218) },
+		{ name = "Murky", color = rgb(72, 90, 62) },
+	},
+
+	-- Directions probed for open sky: straight up plus a ring at ~53 degrees.
+	skyProbes = {
+		Vector3.yAxis,
+		Vector3.new(0.6, 0.8, 0),
+		Vector3.new(-0.6, 0.8, 0),
+		Vector3.new(0, 0.8, 0.6),
+		Vector3.new(0, 0.8, -0.6),
+	},
+
+	bloomSize = { 0, 12, 24, 44 },
+	bloomIntensity = { 0, 0.45, 0.8, 1 },
+	rainRate = { 140, 380, 800, 1500 },
+	snowRate = { 50, 140, 320, 650 },
+	splashRate = { 60, 160, 320, 600 },
+	moteRate = { 0, 5, 12, 26 },
+	lightShadowBudget = { 0, 12, 32, math.huge },
+
+	-- Terrain materials that whiten under settled snow, and how far.
+	snowMaterials = {
+		{ "Grass", 0.9 },
+		{ "LeafyGrass", 0.9 },
+		{ "Ground", 0.75 },
+		{ "Mud", 0.55 },
+		{ "Sand", 0.5 },
+		{ "Limestone", 0.45 },
+		{ "Rock", 0.4 },
+		{ "Slate", 0.35 },
+		{ "Cobblestone", 0.35 },
+		{ "Basalt", 0.3 },
+		{ "Pavement", 0.3 },
+		{ "Asphalt", 0.25 },
+	},
+	snowColor = rgb(236, 240, 246),
+	caveAir = rgb(10, 11, 14),
+	mistAir = rgb(214, 220, 228),
+
+	atmosphereProperties = { "Density", "Offset", "Color", "Decay", "Glare", "Haze" },
+	skyProperties = { "StarCount", "SunAngularSize", "MoonAngularSize" },
+	cloudProperties = { "Cover", "Density", "Color", "Enabled" },
+	waterProperties = { "WaterColor", "WaterReflectance", "WaterTransparency", "WaterWaveSize", "WaterWaveSpeed" },
+}
+
+-- night -> day, then towards the golden-hour colour near the horizon.
+local function skyBlend(dayColor, goldColor, nightColor)
+	return nightColor:Lerp(dayColor, F.day):Lerp(goldColor, F.twilight * 0.85)
+end
+
+-- The frame is split into stages so each one stays readable. They run in the
+-- order listed in Engine.frame further down.
+local Stage = {}
+
+-- Clock: who owns Lighting.ClockTime this frame.
+function Stage.clock(dt)
+	local mode = get("atmo.clock")
+	if get("fun.timelapse") then
+		sim.clock = (sim.clock + dt * 24 / 40) % 24
+		sim.clockOwned = true
+		put(Lighting, "ClockTime", sim.clock, 0.0005)
+	elseif mode == 2 then
+		-- Glide to the chosen hour the short way round the dial.
+		local delta = (get("atmo.time") % 24 - sim.clock + 12) % 24 - 12
+		sim.clock = (sim.clock + delta * (1 - math.exp(-2.5 * dt))) % 24
+		sim.clockOwned = true
+		put(Lighting, "ClockTime", sim.clock, 0.002)
+	elseif mode == 3 then
+		sim.clock = (sim.clock + dt * 24 / (get("atmo.dayLength") * 60)) % 24
+		sim.clockOwned = true
+		-- 0.004 h is a sun movement of 0.06 degrees: invisible, but it means
+		-- the shadow maps are only invalidated a few times per second.
+		put(Lighting, "ClockTime", sim.clock, 0.004)
+	else
+		if sim.clockOwned then
+			sim.clockOwned = false
+			Baseline.releaseLighting({ "ClockTime" })
+		end
+		sim.clock = Lighting.ClockTime
+	end
+end
+
+-- Sun: turn the sun's height into the three blend factors everything uses.
+function Stage.sun()
+	local sun = Lighting:GetSunDirection()
+	local height = sun.Y
+	F.sun = sun
+	F.sunHeight = height
+	F.day = smoothstep(-0.12, 0.22, height)
+	F.night = 1 - F.day
+	F.twilight = clamp01(1 - math.abs(height - 0.02) / 0.28) ^ 1.5
+	F.reimagined = get("atmo.style") == 2
+	F.season = Look.seasons[get("world.season")]
+	local filterIndex = get("fun.filter")
+	F.filter = Look.filters[filterIndex]
+	F.filterStrength = filterIndex > 1 and get("fun.filterStrength") or 0
+end
+
+-- Weather: cross-fade between weather types and schedule lightning.
+function Stage.weather(dt)
+	local weather = get("world.weather")
+	sim.rain = approach(sim.rain, (weather == 2 or weather == 3) and 1 or 0, 0.6, dt)
+	sim.storm = approach(sim.storm, weather == 3 and 1 or 0, 0.5, dt)
+	sim.snow = approach(sim.snow, weather == 4 and 1 or 0, 0.6, dt)
+	sim.overcast = math.max(sim.rain * 0.8, sim.storm, sim.snow * 0.6)
+
+	-- Surfaces soak quickly and dry slowly.
+	local wetTarget = (get("world.wetness") and sim.rain > 0.5) and 1 or 0
+	sim.wet = approach(sim.wet, wetTarget, wetTarget > sim.wet and 0.12 or 0.03, dt)
+
+	-- Rain leaves droplets hanging in the air for a while after it stops,
+	-- which is when rainbows appear. The memory fades over two minutes.
+	if sim.rain > 0.3 then
+		sim.rainMemory = 1
+	else
+		sim.rainMemory = math.max(0, sim.rainMemory - dt / 120)
+	end
+
+	if sim.storm > 0.6 and get("world.lightning") then
+		local now = sim.time
+		if now >= sim.nextStrike then
+			sim.nextStrike = now + 5 + math.random() * 11
+			sim.flash = 1
+			sim.strikeQueued = true
+			-- Real lightning usually re-strikes along the same channel.
+			sim.restrike = now + 0.09 + math.random() * 0.1
+		end
+		if sim.restrike and now >= sim.restrike then
+			sim.flash = math.max(sim.flash, 0.7)
+			sim.restrike = nil
+		end
+	end
+	sim.flash = approach(sim.flash, 0, 7, dt)
+
+	-- Wind follows the place's own direction if it has one.
+	local baseWind = Baseline.wind
+	local direction = baseWind.Magnitude > 0.5 and baseWind.Unit or Vector3.new(0.8, 0, 0.6)
+	local strength = get("world.wind") * 24 + sim.storm * 20 + sim.rain * 6
+	local gust = 1 + 0.3 * math.noise(sim.time * 0.25, 7.3)
+	F.wind = direction * (strength * gust)
+	put(Workspace, "GlobalWind", F.wind, 0.4)
+end
+
+-- Probes: a handful of raycasts that tell the simulation whether the camera
+-- is under cover. Auto exposure and precipitation both depend on the answer.
+-- The tier decides how many rays and how often, which is its whole cost.
+function Stage.probes(dt)
+	local params = sim.rayParams
+	if every("filter", 1, dt) then
+		local ignore = {}
+		if localPlayer.Character then
+			table.insert(ignore, localPlayer.Character)
+		end
+		if Fx.world then
+			table.insert(ignore, Fx.world)
+		end
+		params.FilterDescendantsInstances = ignore
+	end
+
+	local exposureTier = Settings.tier("cam.exposure")
+	local precipitation = sim.rain > 0.01 or sim.snow > 0.01
+	local probes = Look.skyProbes
+
+	if exposureTier == 3 or get("atmo.caveFog") then
+		-- One probe per tick, round-robin, rather than all five in one frame:
+		-- the same picture of the sky, spread evenly so it never spikes.
+		if every("sky", 0.025, dt) then
+			local index = sim.probeIndex % #probes + 1
+			sim.probeIndex = index
+			local clear = Workspace:Raycast(F.camPos, probes[index] * 160, params) == nil
+			sim.probeOpen[index] = clear
+			if index == 1 then
+				sim.overheadOpen = clear
+			end
+			local open = 0
+			for probe = 1, #probes do
+				if sim.probeOpen[probe] ~= false then
+					open += 1
+				end
+			end
+			sim.skyOpen = open / #probes
+		end
+	elseif exposureTier == 2 or precipitation then
+		if every("sky", 0.25, dt) then
+			local clear = Workspace:Raycast(F.camPos, Vector3.yAxis * 160, params) == nil
+			sim.overheadOpen = clear
+			sim.skyOpen = clear and 1 or 0
+		end
+	else
+		sim.overheadOpen = true
+		sim.skyOpen = 1
+	end
+	sim.shelter = approach(sim.shelter, sim.overheadOpen and 0 or 1, 3, dt)
+
+	-- Caves: no open sky in any direction.
+	local enclosed = get("atmo.caveFog") and not sim.overheadOpen and sim.skyOpen < 0.05
+	sim.cave = approach(sim.cave, enclosed and 1 or 0, 0.6, dt)
+
+	-- Eye adaptation. Indoors by day the image is lifted; staring at the sun
+	-- pulls it down. Brightening is slower than darkening, like real eyes.
+	-- "Adaptation range" caps the correction, "speed" scales both rates.
+	local target = 0
+	if exposureTier > 1 then
+		local range = get("cam.exposureRange")
+		target = (1 - sim.skyOpen) * range * F.day
+		local glare = math.max(0, F.look:Dot(F.sun))
+		target -= glare ^ 6 * range * 0.47 * F.day * sim.skyOpen * (1 - sim.overcast)
+		target += F.night * 0.12
+		target = math.clamp(target, -range, range)
+	end
+	local speed = get("cam.exposureSpeed")
+	sim.adapt = approach(sim.adapt, target, (target > sim.adapt and 0.9 or 2.2) * speed, dt)
+end
+
+-- Keep a tint's hue without the darkening a plain multiply would bring.
+local function tintKeepingLevel(color, tint)
+	local level = math.max(luminance(tint), 0.05)
+	return Color3.new(
+		clamp01(color.R * tint.R / level),
+		clamp01(color.G * tint.G / level),
+		clamp01(color.B * tint.B / level)
+	)
+end
+
+-- Lighting: the global light rig, Atmosphere, Sky and Clouds.
+function Stage.lighting(dt)
+	local palette = Look.palette
+	local base = Baseline.lighting
+	local overcast = sim.overcast
+	local nightLight = get("atmo.nightLight")
+	local underwater = sim.underwater
+	local dynamic = get("atmo.dynamic")
+
+	-- Cloud shadows: a drifting noise field, sampled under the camera, stands
+	-- in for the clouds overhead. Where it falls below the cover, the sun dims.
+	local shadeTarget = 0
+	if dynamic and get("atmo.cloudShadows") and get("atmo.clouds") and F.day > 0.05 then
+		local drift = F.wind * sim.time
+		local field = math.noise((F.camPos.X - drift.X) / 420, (F.camPos.Z - drift.Z) / 420, 3.7) + 0.5
+		local cover = get("atmo.cloudCover") * 0.8 + overcast * 0.5
+		shadeTarget = smoothstep(cover, cover - 0.15, field) * 0.38 * F.day * (1 - overcast)
+	end
+	sim.cloudShade = approach(sim.cloudShade, shadeTarget, 1.2, dt)
+
+	-- Morning mist: low fog around sunrise that burns off as the sun climbs.
+	local mistTarget = 0
+	if get("atmo.morningMist") and sim.clock > 4 and sim.clock < 10.5 then
+		mistTarget = (1 - smoothstep(0.02, 0.4, F.sunHeight)) * (1 - sim.storm)
+	end
+	sim.mist = approach(sim.mist, mistTarget, 0.25, dt)
+
+	-- The light rig. "Dynamic lighting" computes it from the clock; with it off
+	-- the place's own values are the base. Either way the grade's highlight and
+	-- shadow controls act on real light: highlights scale and tint the sun,
+	-- shadows lift and tint the ambient that fills shaded areas.
+	local highlights = get("cam.highlights")
+	local shadows = get("cam.shadows")
+	local shadowWheel = get("cam.shadowAmount")
+	local highlightWheel = get("cam.highlightAmount")
+	local graded = highlights ~= 0
+		or shadows ~= 0
+		or shadowWheel > 0
+		or highlightWheel > 0
+		or underwater > 0.001
+		or F.aurora > 0.001
+	if dynamic or graded then
+		sim.rigOwned = true
+		local sunTint, outdoor, indoor, brightness
+		if dynamic then
+			-- Sun / moon tint. ColorShift_Top is added to sun-facing surfaces.
+			sunTint = skyBlend(palette.sunDay, palette.sunGold, palette.sunNight)
+			sunTint = scaleColor(sunTint, (1 - 0.7 * overcast) * (F.reimagined and 0.7 or 1))
+
+			-- Ambient. Nights scale with the "Night brightness" slider.
+			local nightScale = 0.5 + 1.2 * nightLight
+			outdoor = skyBlend(palette.outdoorDay, palette.outdoorGold, scaleColor(palette.outdoorNight, nightScale))
+			indoor = skyBlend(palette.indoorDay, palette.indoorGold, scaleColor(palette.indoorNight, nightScale))
+			outdoor = outdoor:Lerp(scaleColor(palette.overcastAmbient, 0.3 + 0.7 * F.day), overcast * 0.6)
+			if F.reimagined then
+				outdoor = scaleColor(outdoor, 1.18)
+				indoor = scaleColor(indoor, 1.18)
+			end
+			-- Snow on the ground bounces a lot of light back up.
+			outdoor = scaleColor(outdoor, 1 + sim.snow * 0.12)
+
+			-- Future lighting is physically brighter per unit, so its sun is
+			-- driven harder than the shadow-map and voxel pipelines.
+			local dayBrightness = (Renderer.futureClass and 3 or 2.4) - (F.reimagined and 0.3 or 0)
+			local nightBrightness = 0.7 + nightLight * 1.3
+			brightness = lerp(nightBrightness, dayBrightness, F.day) * (1 - 0.45 * overcast) + sim.flash * 2
+			brightness *= 1 - sim.cloudShade
+		else
+			sunTint = base.ColorShift_Top or Color3.new()
+			outdoor = base.OutdoorAmbient or Color3.new(0.5, 0.5, 0.5)
+			indoor = base.Ambient or Color3.new()
+			brightness = (base.Brightness or 2) + sim.flash * 2
+		end
+
+		-- The aurora washes open ground in its own colour.
+		if F.aurora > 0.001 then
+			outdoor = outdoor:Lerp(scaleColor(F.auroraColor, 0.32), F.aurora * 0.35)
+		end
+
+		brightness *= 1 + 0.35 * highlights
+		if highlightWheel > 0 then
+			local level = math.max(luminance(sunTint) * 1.4, 0.1)
+			sunTint = sunTint:Lerp(scaleColor(hueTint(get("cam.highlightHue"), 1), level), highlightWheel * 0.6)
+		end
+
+		local lift = math.max(0, 1 + 0.6 * shadows)
+		outdoor = scaleColor(outdoor, lift)
+		indoor = scaleColor(indoor, lift)
+		if shadowWheel > 0 then
+			local tint = hueTint(get("cam.shadowHue"), shadowWheel * 0.6)
+			outdoor = tintKeepingLevel(outdoor, tint)
+			indoor = tintKeepingLevel(indoor, tint)
+		end
+
+		-- Below the surface all light arrives filtered through the water, and
+		-- the waves above throw shifting caustics.
+		if underwater > 0.001 then
+			local water = sim.waterColor
+			outdoor = outdoor:Lerp(scaleColor(tintKeepingLevel(outdoor, water), 0.75), underwater * 0.85)
+			indoor = indoor:Lerp(scaleColor(tintKeepingLevel(indoor, water), 0.75), underwater * 0.85)
+			sunTint = sunTint:Lerp(multiplyColor(sunTint, water), underwater)
+			local caustics = 1 + 0.24 * math.noise(sim.time * 2.3, 5.1, F.camPos.X * 0.05)
+			brightness *= lerp(1, 0.65 * caustics, underwater)
+		end
+
+		put(Lighting, "ColorShift_Top", sunTint)
+		put(Lighting, "OutdoorAmbient", outdoor)
+		put(Lighting, "Ambient", indoor)
+		put(Lighting, "Brightness", math.max(brightness, 0), 0.01)
+	elseif sim.rigOwned then
+		sim.rigOwned = false
+		Baseline.releaseLighting({ "ColorShift_Top", "OutdoorAmbient", "Ambient", "Brightness" })
+	end
+
+	-- Image-based lighting. Wet surfaces borrow extra specular.
+	put(Lighting, "EnvironmentDiffuseScale", get("mat.diffuse"))
+	put(Lighting, "EnvironmentSpecularScale", math.min(1, get("mat.specular") + sim.wet * 0.35))
+
+	-- Soft shadows only exist with shadow maps (ShadowMap and Future).
+	if Caps.softShadows then
+		sim.softOwned = true
+		put(Lighting, "ShadowSoftness", get("world.shadowSoftness"))
+	elseif sim.softOwned then
+		sim.softOwned = false
+		Baseline.releaseLighting({ "ShadowSoftness" })
+	end
+
+	if get("world.sunOverride") then
+		sim.sunOwned = true
+		put(Lighting, "GeographicLatitude", get("world.sunTilt"), 0.05)
+	elseif sim.sunOwned then
+		sim.sunOwned = false
+		Baseline.releaseLighting({ "GeographicLatitude" })
+	end
+
+	-- Exposure is layered on top of whatever the place authored.
+	local exposure = (base.ExposureCompensation or 0)
+		+ get("cam.exposureBias")
+		+ sim.adapt
+		- overcast * 0.25 * F.day
+		+ sim.flash * 1.1
+		+ (F.filter.exposure or 0) * F.filterStrength
+		- underwater * 0.3
+	put(Lighting, "ExposureCompensation", math.clamp(exposure, -3, 3), 0.004)
+
+	-- Atmosphere: fog thickens in bad weather, glows at dusk, lies low in the
+	-- morning, goes dark in caves and turns to water below the surface. The
+	-- grade's Dehaze thins (or thickens) all of it.
+	local atmosphere = Fx.atmosphere
+	if atmosphere then
+		local dehaze = get("cam.dehaze")
+		local density = lerp(0.16, 0.6, get("atmo.fog")) + overcast * 0.18 + F.night * 0.03 + sim.mist * 0.22 + sim.cave * 0.12
+		local haze = get("atmo.haze") * 2.6 + overcast * 1.8 + F.twilight * 0.7 + sim.mist * 1.6
+		local glare = (0.1 * F.day + 0.9 * F.twilight) * (1 - overcast) * (1 - sim.mist * 0.5)
+		density *= 1 - 0.5 * dehaze
+		haze = math.max(0, haze * (1 - 0.8 * dehaze))
+		local color = skyBlend(palette.airDay, palette.airGold, palette.airNight)
+		color = color:Lerp(scaleColor(palette.airStorm, 0.25 + 0.75 * F.day), overcast * 0.7)
+		if sim.mist > 0.001 then
+			color = color:Lerp(scaleColor(Look.mistAir, 0.35 + 0.65 * F.day), sim.mist * 0.5)
+		end
+		if sim.cave > 0.001 then
+			color = color:Lerp(Look.caveAir, sim.cave * 0.85)
+		end
+		local decay = skyBlend(palette.decayDay, palette.decayGold, palette.decayNight)
+		local offset = F.reimagined and 0.32 or 0.2
+		if underwater > 0.001 then
+			local deep = scaleColor(sim.waterColor, 0.35 + 0.45 * F.day)
+			density = lerp(density, 0.45 + 0.5 * get("mat.underwaterFog"), underwater)
+			haze = lerp(haze, 0, underwater)
+			glare = lerp(glare, 0, underwater)
+			offset = lerp(offset, 0, underwater)
+			color = color:Lerp(deep, underwater)
+			decay = decay:Lerp(deep, underwater)
+		end
+		put(atmosphere, "Density", math.clamp(density, 0, 0.95), 0.003)
+		put(atmosphere, "Haze", haze, 0.01)
+		put(atmosphere, "Glare", glare, 0.01)
+		put(atmosphere, "Offset", offset, 0.005)
+		put(atmosphere, "Color", color)
+		put(atmosphere, "Decay", decay)
+	end
+
+	-- Sky. Stars fade with the light instead of switching on at a fixed hour:
+	-- their visibility follows the sun below the horizon, eased, and drives
+	-- the star count, so they appear one by one through dusk and thin out
+	-- again at dawn. The count is quantised so the field is not rebuilt for
+	-- every tiny change.
+	local sky = Fx.sky
+	if sky then
+		local starTarget = smoothstep(0.08, -0.14, F.sunHeight) * (1 - overcast * 0.95) * (1 - underwater)
+		sim.stars = approach(sim.stars, starTarget, 0.5, dt)
+		local count = math.floor(get("atmo.stars") * 6000 * sim.stars / 25 + 0.5) * 25
+		local size = get("fun.celestial")
+		put(sky, "StarCount", count, 0.5)
+		put(sky, "SunAngularSize", Fx.skyBase.sun * size, 0.05)
+		put(sky, "MoonAngularSize", Fx.skyBase.moon * size, 0.05)
+	end
+
+	-- Clouds: cover rises with the weather, colour follows the sun.
+	local clouds = Fx.clouds
+	if clouds then
+		if get("atmo.clouds") then
+			local color = skyBlend(palette.cloudDay, palette.cloudGold, palette.cloudNight)
+			color = color:Lerp(scaleColor(palette.cloudStorm, 0.3 + 0.7 * F.day), overcast * 0.8)
+			put(clouds, "Enabled", true)
+			put(clouds, "Cover", clamp01(get("atmo.cloudCover") * 0.8 + overcast * 0.5), 0.004)
+			put(clouds, "Density", clamp01(0.5 + overcast * 0.4), 0.004)
+			put(clouds, "Color", color)
+		else
+			put(clouds, "Enabled", false)
+		end
+	end
+end
+
+-- Terrain: water styling and the season's grass colours.
+function Stage.terrain(dt)
+	local terrain = Fx.terrain
+	if not terrain then
+		return
+	end
+
+	local water = Look.waters[get("mat.water")]
+	if water.color then
+		sim.waterOwned = true
+		-- Water darkens with the sky so it does not glow at night.
+		put(terrain, "WaterColor", scaleColor(water.color, 0.3 + 0.7 * F.day))
+		put(terrain, "WaterReflectance", get("mat.waterReflect"))
+		put(terrain, "WaterTransparency", get("mat.waterClarity"))
+		put(terrain, "WaterWaveSize", clamp01(get("mat.waveSize") * (1 + sim.storm * 0.8)))
+		put(terrain, "WaterWaveSpeed", get("mat.waveSpeed") * 40, 0.05)
+	elseif sim.waterOwned then
+		sim.waterOwned = false
+		Baseline.restoreInstance(terrain)
+	end
+
+	-- Snow settles over a couple of minutes of snowfall and melts more slowly
+	-- once it stops; switching the option off clears it straight away.
+	local coverOn = get("world.snowCover")
+	local snowing = coverOn and sim.snow > 0.5
+	sim.snowCover = approach(sim.snowCover, snowing and 1 or 0, not coverOn and 2 or (snowing and 0.02 or 0.008), dt)
+	local coverStep = math.floor(sim.snowCover * 40 + 0.5) / 40
+
+	-- Terrain colours are recomputed only when the season or the (stepped)
+	-- snow cover changes: each material is original -> season -> snow.
+	local seasonIndex = get("world.season")
+	if seasonIndex == sim.seasonApplied and coverStep == sim.coverApplied then
+		return
+	end
+	sim.seasonApplied = seasonIndex
+	sim.coverApplied = coverStep
+	local season = Look.seasons[seasonIndex]
+	for _, entry in Look.snowMaterials do
+		local material = (Enum.Material :: any)[entry[1]]
+		local seasonal = nil
+		if material == Enum.Material.Grass then
+			seasonal = season.grass
+		elseif material == Enum.Material.LeafyGrass then
+			seasonal = season.leafy
+		end
+		local original = Baseline.terrainColors[material]
+		if seasonal or coverStep > 0 or original then
+			if original == nil then
+				local ok, color = pcall(terrain.GetMaterialColor, terrain, material)
+				if not ok then
+					continue
+				end
+				original = color
+				Baseline.mark(terrain, "Material_" .. entry[1], original)
+			end
+			local color = seasonal or original
+			if coverStep > 0 then
+				color = color:Lerp(Look.snowColor, coverStep * entry[2])
+			end
+			pcall(terrain.SetMaterialColor, terrain, material, color)
+		end
+	end
+end
+
+--------------------------------------------------------------------------------
+-- 9. WORLD: PRECIPITATION, PUDDLES, AMBIENT PARTICLES
+--    All of it lives on invisible anchored parts that follow the camera, so
+--    the effects surround the player wherever they go at a fixed cost.
+--------------------------------------------------------------------------------
+
+-- Invisible anchored part used as an emitter host or an attachment anchor.
+local function hiddenPart(name, size, parent)
+	return create("Part", {
+		Name = name,
+		Anchored = true,
+		CanCollide = false,
+		CanQuery = false,
+		CanTouch = false,
+		CastShadow = false,
+		Locked = true,
+		Transparency = 1,
+		Size = size,
+		Parent = parent,
+	})
+end
+
+local World: { [string]: any } = { puddles = {}, groundY = nil }
+
+do
+	local PUDDLE_COUNT = { 0, 10, 20, 36 }
+	local PUDDLE_RANGE = 75
+	local PUDDLE_COLOR = rgb(44, 50, 56)
+	-- Cylinders are round along X; this stands them on end so they lie flat.
+	local FLAT = CFrame.Angles(0, 0, math.pi / 2)
+	-- Ground a puddle never forms on.
+	local DRY_GROUND = {
+		[Enum.Material.Water] = true,
+		[Enum.Material.Glass] = true,
+		[Enum.Material.Neon] = true,
+		[Enum.Material.ForceField] = true,
+		[Enum.Material.Sand] = true,
+		[Enum.Material.Snow] = true,
+		[Enum.Material.Glacier] = true,
+		[Enum.Material.Ice] = true,
+	}
+
+	function World.start()
+		local folder = Baseline.own(create("Folder", { Name = "SolsticeWorld" }))
+		folder.Parent = Workspace
+		Fx.world = folder
+		World.folder = folder
+		World.groundY = nil
+		table.clear(World.puddles)
+
+		-- Precipitation falls from a wide plate above the camera. The plate is
+		-- tilted into the wind (see Stage.particles), so drops leave it already
+		-- moving with the wind and fall in straight slanted lines.
+		local canopy = hiddenPart("Canopy", Vector3.new(120, 1, 120), folder)
+		World.canopy = canopy
+
+		-- Rain: a soft dot squashed into an upright streak. The streak used to
+		-- be oriented with VelocityParallel, which lays the particle's stretch
+		-- axis across the direction of travel: every drop rendered as a
+		-- horizontal dash. FacingCameraWorldUp keeps the stretch on the world
+		-- vertical, which is what falling rain looks like from any angle.
+		World.rain = create("ParticleEmitter", {
+			Name = "Rain",
+			Enabled = false,
+			Rate = 0,
+			Texture = CONFIG.ParticleTexture,
+			EmissionDirection = Enum.NormalId.Bottom,
+			Orientation = Enum.ParticleOrientation.FacingCameraWorldUp,
+			Lifetime = NumberRange.new(0.85, 1.05),
+			Speed = NumberRange.new(92, 108),
+			SpreadAngle = Vector2.new(2, 2),
+			Size = NumberSequence.new(0.34),
+			Squash = NumberSequence.new(2.6),
+			Transparency = NumberSequence.new(0.45),
+			Color = ColorSequence.new(rgb(196, 212, 232)),
+			LightEmission = 0.15,
+			LightInfluence = 0.85,
+			Parent = canopy,
+		})
+
+		World.snow = create("ParticleEmitter", {
+			Name = "Snow",
+			Enabled = false,
+			Rate = 0,
+			Texture = CONFIG.ParticleTexture,
+			EmissionDirection = Enum.NormalId.Bottom,
+			Lifetime = NumberRange.new(7, 9),
+			Speed = NumberRange.new(7, 11),
+			SpreadAngle = Vector2.new(18, 18),
+			Rotation = NumberRange.new(0, 360),
+			Size = NumberSequence.new(0.22),
+			Transparency = numberSequence({ { 0, 1 }, { 0.08, 0.15 }, { 0.9, 0.15 }, { 1, 1 } }),
+			Color = ColorSequence.new(rgb(255, 255, 255)),
+			LightEmission = 0.25,
+			LightInfluence = 0.8,
+			Parent = canopy,
+		})
+
+		-- Splashes burst from a pad laid on the ground under the camera.
+		local pad = hiddenPart("SplashPad", Vector3.new(46, 0.2, 46), folder)
+		World.splashPad = pad
+		World.splash = create("ParticleEmitter", {
+			Name = "Splash",
+			Enabled = false,
+			Rate = 0,
+			Texture = CONFIG.ParticleTexture,
+			EmissionDirection = Enum.NormalId.Top,
+			Lifetime = NumberRange.new(0.12, 0.22),
+			Speed = NumberRange.new(3, 6),
+			SpreadAngle = Vector2.new(35, 35),
+			Acceleration = Vector3.new(0, -70, 0),
+			Size = numberSequence({ { 0, 0.12 }, { 1, 0.05 } }),
+			Transparency = numberSequence({ { 0, 0.35 }, { 1, 1 } }),
+			Color = ColorSequence.new(rgb(210, 220, 235)),
+			LightEmission = 0.1,
+			LightInfluence = 0.9,
+			Parent = pad,
+		})
+
+		-- Ambient particles spawn anywhere inside a box around the camera.
+		local meadow = hiddenPart("Meadow", Vector3.new(80, 28, 80), folder)
+		World.meadow = meadow
+
+		World.fireflies = create("ParticleEmitter", {
+			Name = "Fireflies",
+			Enabled = false,
+			Rate = 0,
+			Texture = CONFIG.ParticleTexture,
+			Lifetime = NumberRange.new(5, 9),
+			Speed = NumberRange.new(0.6, 1.8),
+			SpreadAngle = Vector2.new(180, 180),
+			Size = numberSequence({ { 0, 0 }, { 0.15, 0.2 }, { 0.85, 0.2 }, { 1, 0 } }),
+			-- Two dips in transparency make each one blink twice in its life.
+			Transparency = numberSequence({ { 0, 1 }, { 0.2, 0 }, { 0.5, 0.7 }, { 0.8, 0 }, { 1, 1 } }),
+			Color = ColorSequence.new(rgb(198, 255, 96)),
+			LightEmission = 1,
+			LightInfluence = 0,
+			Brightness = 3,
+			Drag = 0.3,
+			WindAffectsDrag = true,
+			Acceleration = Vector3.new(0, 0.15, 0),
+			Parent = meadow,
+		})
+
+		World.dust = create("ParticleEmitter", {
+			Name = "Dust",
+			Enabled = false,
+			Rate = 0,
+			Texture = CONFIG.ParticleTexture,
+			Lifetime = NumberRange.new(6, 10),
+			Speed = NumberRange.new(0.2, 0.8),
+			SpreadAngle = Vector2.new(180, 180),
+			Size = NumberSequence.new(0.07),
+			Transparency = numberSequence({ { 0, 1 }, { 0.2, 0.7 }, { 0.8, 0.7 }, { 1, 1 } }),
+			Color = ColorSequence.new(rgb(255, 244, 222)),
+			LightEmission = 0.3,
+			LightInfluence = 1,
+			Drag = 0.5,
+			WindAffectsDrag = true,
+			Parent = meadow,
+		})
+	end
+
+	function Stage.particles(dt)
+		local wind = F.wind
+		-- Precipitation has no collision, so it would fall through roofs (and
+		-- into the sea). Under cover or under water the emitters fade out.
+		local open = (1 - sim.shelter) * (1 - sim.underwater)
+		local density = Settings.tier("world.density")
+
+		-- Tilt the canopy into the wind and move it upwind by as far as a drop
+		-- drifts on its way down, so the slanted rain lands around the camera.
+		local horizontal = Vector3.new(wind.X, 0, wind.Z) * 0.9
+		local speed = horizontal.Magnitude
+		local canopyFrame = CFrame.new(F.camPos + Vector3.new(0, 45, 0) - horizontal * 0.45)
+		if speed > 0.5 then
+			canopyFrame *= CFrame.fromAxisAngle(horizontal.Unit:Cross(Vector3.yAxis), math.atan2(speed, 100))
+		end
+
+		local rainAmount = sim.rain * open
+		local snowAmount = sim.snow * open
+		if rainAmount > 0.02 or snowAmount > 0.02 then
+			World.canopy.CFrame = canopyFrame
+		end
+		put(World.rain, "Enabled", rainAmount > 0.02)
+		put(World.rain, "Rate", Look.rainRate[density] * rainAmount * (1 + 0.4 * sim.storm), 2)
+		put(World.snow, "Enabled", snowAmount > 0.02)
+		put(World.snow, "Rate", Look.snowRate[density] * snowAmount, 2)
+		put(World.snow, "Acceleration", horizontal * 0.25, 0.5)
+
+		-- Splashes need to know where the ground is under the camera.
+		local splashAmount = get("world.splashes") and rainAmount or 0
+		if splashAmount > 0.02 and every("splashGround", 0.2, dt) then
+			local hit = Workspace:Raycast(F.camPos + Vector3.new(0, 2, 0), Vector3.new(0, -60, 0), sim.rayParams)
+			World.groundY = hit and hit.Position.Y or nil
+		end
+		local splashing = splashAmount > 0.02 and World.groundY ~= nil
+		put(World.splash, "Enabled", splashing)
+		if splashing then
+			World.splashPad.CFrame = CFrame.new(F.camPos.X, World.groundY + 0.15, F.camPos.Z)
+			put(World.splash, "Rate", Look.splashRate[density] * splashAmount, 2)
+		end
+
+		-- Fireflies come out on dry nights; dust motes hang in daylight.
+		local motes = Look.moteRate[Settings.tier("world.motes")] * (1 - sim.underwater)
+		local fireflies = motes * F.night * (1 - sim.rain) * (1 - sim.snow)
+		local dust = motes * 0.8 * F.day * (1 - sim.overcast)
+		if motes > 0 then
+			World.meadow.CFrame = CFrame.new(F.camPos + Vector3.new(0, 6, 0))
+		end
+		put(World.fireflies, "Enabled", fireflies > 0.3)
+		put(World.fireflies, "Rate", fireflies, 0.25)
+		put(World.dust, "Enabled", dust > 0.3)
+		put(World.dust, "Rate", dust, 0.25)
+	end
+
+	----------------------------------------------------------------------------
+	-- Puddles. Complementary-style rain puddles: while surfaces are wet, flat
+	-- open ground near the player gathers pools of reflective water that
+	-- spread as the rain goes on, ripple under the drops, and shrink away as
+	-- things dry. Each puddle is two or three overlapping glassy discs (for an
+	-- irregular outline) plus a flat ripple emitter. Spots are found with a
+	-- downward ray (flat, not sand or snow) and an upward ray (open to the
+	-- sky), one candidate every 0.15 seconds, so the cost is a trickle.
+	----------------------------------------------------------------------------
+
+	local function makePuddle()
+		local blobs = {}
+		for index = 1, 3 do
+			blobs[index] = create("Part", {
+				Name = "Puddle",
+				Anchored = true,
+				CanCollide = false,
+				CanQuery = false,
+				CanTouch = false,
+				CastShadow = false,
+				Locked = true,
+				Shape = Enum.PartType.Cylinder,
+				Material = Enum.Material.Glass,
+				Color = PUDDLE_COLOR,
+				Reflectance = 0.4,
+				Transparency = 1,
+				Size = Vector3.new(0.04, 1, 1),
+				Parent = World.folder,
+			})
+		end
+		local host = hiddenPart("Ripples", Vector3.new(1, 0.1, 1), World.folder)
+		local ripples = create("ParticleEmitter", {
+			Name = "Ripples",
+			Enabled = false,
+			Rate = 0,
+			Texture = CONFIG.ParticleTexture,
+			EmissionDirection = Enum.NormalId.Top,
+			-- Moving straight up, a VelocityPerpendicular particle lies flat.
+			Orientation = Enum.ParticleOrientation.VelocityPerpendicular,
+			Lifetime = NumberRange.new(0.45, 0.7),
+			Speed = NumberRange.new(0.01),
+			Size = numberSequence({ { 0, 0.05 }, { 1, 0.9 } }),
+			Transparency = numberSequence({ { 0, 0.55 }, { 1, 1 } }),
+			Color = ColorSequence.new(rgb(225, 232, 240)),
+			LightEmission = 0.2,
+			LightInfluence = 0.8,
+			Parent = host,
+		})
+		return {
+			blobs = blobs,
+			host = host,
+			ripples = ripples,
+			seated = false,
+			position = Vector3.zero,
+			size = 0,
+			presence = 0,
+			applied = -1,
+			shape = {},
+		}
+	end
+
+	local function findSpot()
+		local look = Vector3.new(F.look.X, 0, F.look.Z)
+		look = look.Magnitude > 0.1 and look.Unit or Vector3.zAxis
+		-- Mostly in front of the camera, where puddles will be seen.
+		local direction = CFrame.fromAxisAngle(Vector3.yAxis, between(-1.3, 1.3)):VectorToWorldSpace(look)
+		local origin = F.camPos + direction * between(6, PUDDLE_RANGE) + Vector3.new(0, 40, 0)
+		local hit = Workspace:Raycast(origin, Vector3.new(0, -140, 0), sim.rayParams)
+		if not hit or hit.Normal.Y < 0.96 or DRY_GROUND[hit.Material] then
+			return nil
+		end
+		local surface = hit.Instance
+		if surface ~= Fx.terrain then
+			if surface.Transparency > 0.5 or (surface.Parent and surface.Parent:FindFirstChildOfClass("Humanoid")) then
+				return nil
+			end
+		end
+		-- Only where rain actually falls.
+		if Workspace:Raycast(hit.Position + Vector3.new(0, 0.5, 0), Vector3.new(0, 250, 0), sim.rayParams) then
+			return nil
+		end
+		return hit.Position
+	end
+
+	local function seat(puddle, position)
+		puddle.seated = true
+		puddle.position = position
+		puddle.size = between(3, 8.5)
+		puddle.presence = 0
+		puddle.applied = -1
+		for index = 1, #puddle.blobs do
+			local offset = Vector3.zero
+			if index > 1 then
+				offset = Vector3.new(between(-0.35, 0.35), 0, between(-0.35, 0.35)) * puddle.size
+			end
+			puddle.shape[index] = { offset = offset, scale = index == 1 and 1 or between(0.45, 0.8) }
+		end
+		puddle.host.CFrame = CFrame.new(position + Vector3.new(0, 0.08, 0))
+		puddle.host.Size = Vector3.new(puddle.size * 0.7, 0.1, puddle.size * 0.7)
+	end
+
+	local function updatePuddle(puddle, dt, wet, rippleScale)
+		local target = puddle.seated and wet or 0
+		puddle.presence = approach(puddle.presence, target, target > puddle.presence and 0.25 or 0.08, dt)
+		if puddle.seated and wet < 0.02 and puddle.presence < 0.02 then
+			puddle.seated = false
+			puddle.presence = 0
+		end
+		local presence = puddle.presence
+		if math.abs(presence - puddle.applied) > 0.015 or (presence < 0.01 and puddle.applied >= 0.01) then
+			puddle.applied = presence
+			-- Puddles spread as they fill and shrink as they dry.
+			local grow = 0.35 + 0.65 * presence
+			for index, blob in puddle.blobs do
+				local shape = puddle.shape[index]
+				if presence < 0.01 or not shape then
+					blob.Transparency = 1
+				else
+					local diameter = puddle.size * shape.scale * grow
+					blob.Size = Vector3.new(0.04, diameter, diameter)
+					blob.CFrame = CFrame.new(puddle.position + shape.offset * grow + Vector3.new(0, 0.025 + index * 0.004, 0)) * FLAT
+					blob.Transparency = lerp(1, 0.3, presence)
+				end
+			end
+		end
+		local rate = rippleScale * puddle.size * 2.5 * presence
+		put(puddle.ripples, "Enabled", rate > 0.3)
+		put(puddle.ripples, "Rate", rate, 0.2)
+	end
+
+	function Stage.puddles(dt)
+		local tier = get("world.wetness") and Settings.tier("world.puddles") or 1
+		local count = PUDDLE_COUNT[tier]
+		local pool = World.puddles
+		-- The pool grows on first need and is reused for the session.
+		while #pool < count do
+			table.insert(pool, makePuddle())
+		end
+		if #pool == 0 then
+			return
+		end
+		local wet = sim.wet
+		if wet > 0.05 and count > 0 and every("puddleSeat", 0.15, dt) then
+			for index = 1, count do
+				local puddle = pool[index]
+				if not puddle.seated or (puddle.position - F.camPos).Magnitude > PUDDLE_RANGE + 30 then
+					local spot = findSpot()
+					if spot then
+						seat(puddle, spot)
+					end
+					break
+				end
+			end
+		end
+		local rippleScale = (get("world.ripples") and sim.rain or 0) * (1 - sim.underwater)
+		for index, puddle in pool do
+			if index > count then
+				puddle.seated = false
+			end
+			updatePuddle(puddle, dt, wet, rippleScale)
+		end
+	end
+end
+
+--------------------------------------------------------------------------------
+-- 10. SKY SPECTACLES: AURORA, MILKY WAY, SHOOTING STARS, RAINBOWS, LIGHTNING
+--     Drawn with camera-facing Beams on one invisible part that follows the
+--     camera, so they hang at a fixed height in the sky wherever the player
+--     goes. Everything is built on first use and costs nothing while hidden.
+--------------------------------------------------------------------------------
+
+local Spectacle: { [string]: any } = { rays = {}, galaxy = {}, meteors = {}, bands = {}, bolt = {} }
+
+do
+	----------------------------------------------------------------------------
+	-- Aurora.
+	--
+	-- A real aurora is a set of curtains: thousands of near-vertical rays
+	-- hanging from a sharp, bright lower edge (green oxygen emission at about
+	-- 100 km) and fading upwards into red and violet (higher oxygen and
+	-- nitrogen). The curtains fold slowly, brightness surges travel along
+	-- them, and individual rays flicker. When a curtain passes overhead the
+	-- rays seem to converge on one point (the corona).
+	--
+	-- Here each curtain is a row of camera-facing beams, one per ray, set
+	-- side by side so they merge into a sheet. Beams run from the curtain's
+	-- lower edge straight up, coloured and faded along their length. Curtains
+	-- are laid across the whole sky, from the northern horizon over the top
+	-- (the "Sky coverage" slider), so looking straight up you see the corona.
+	-- Ray brightness is quantised to 12 levels with every transparency curve
+	-- built up front, so the animation allocates nothing.
+	----------------------------------------------------------------------------
+
+	local AURORA_CURTAINS = { 0, 2, 3, 4 }
+	local AURORA_RAYS = { 0, 22, 30, 40 }
+	local AURORA_SPAN = 1100 -- half the length of a curtain, in studs
+	local AURORA_LEVELS = 12
+	local AURORA_REACH = { 0.5, 0.68, 0.85 } -- how far up each ray shape stays bright
+
+	local AURORA_PALETTES = {
+		{
+			glow = rgb(70, 255, 140),
+			sequence = colorSequence({
+				{ 0, rgb(130, 255, 170) },
+				{ 0.2, rgb(70, 255, 140) },
+				{ 0.5, rgb(40, 225, 150) },
+				{ 0.75, rgb(120, 90, 200) },
+				{ 1, rgb(200, 60, 120) },
+			}),
+		},
+		{
+			glow = rgb(90, 255, 160),
+			sequence = colorSequence({
+				{ 0, rgb(255, 80, 170) },
+				{ 0.06, rgb(255, 120, 190) },
+				{ 0.14, rgb(90, 255, 150) },
+				{ 0.55, rgb(50, 230, 160) },
+				{ 0.85, rgb(140, 90, 210) },
+				{ 1, rgb(210, 60, 120) },
+			}),
+		},
+		{
+			glow = rgb(255, 70, 90),
+			sequence = colorSequence({
+				{ 0, rgb(255, 130, 150) },
+				{ 0.3, rgb(255, 60, 80) },
+				{ 0.7, rgb(210, 40, 90) },
+				{ 1, rgb(140, 40, 120) },
+			}),
+		},
+		{
+			glow = rgb(140, 100, 255),
+			sequence = colorSequence({
+				{ 0, rgb(170, 150, 255) },
+				{ 0.4, rgb(130, 90, 255) },
+				{ 0.8, rgb(90, 60, 220) },
+				{ 1, rgb(200, 80, 200) },
+			}),
+		},
+		{
+			glow = rgb(70, 220, 255),
+			sequence = colorSequence({
+				{ 0, rgb(130, 255, 230) },
+				{ 0.4, rgb(60, 220, 255) },
+				{ 0.8, rgb(70, 120, 255) },
+				{ 1, rgb(140, 90, 255) },
+			}),
+		},
+	}
+
+	-- Transparency along a ray, bottom to top: a crisp lower edge, then a long
+	-- soft fade upward. One curve per (shape, brightness level).
+	local auroraCurves = {}
+	for shape, reach in AURORA_REACH do
+		auroraCurves[shape] = {}
+		for level = 1, AURORA_LEVELS do
+			local alpha = level / AURORA_LEVELS * 0.92
+			auroraCurves[shape][level] = numberSequence({
+				{ 0, 1 },
+				{ 0.025, 1 - alpha * 0.55 },
+				{ 0.08, 1 - alpha },
+				{ 0.3, 1 - alpha * 0.8 },
+				{ reach, 1 - alpha * 0.3 },
+				{ 1, 1 },
+			})
+		end
+	end
+
+	local function skyBeam(attachment0, attachment1, properties)
+		local beam = create("Beam", {
+			Attachment0 = attachment0,
+			Attachment1 = attachment1,
+			FaceCamera = true,
+			LightInfluence = 0,
+			LightEmission = 1,
+			Transparency = NumberSequence.new(1),
+			Enabled = false,
+			Parent = Spectacle.crown,
+		})
+		for key, value in properties do
+			(beam :: any)[key] = value
+		end
+		return beam
+	end
+
+	local function anchor()
+		return create("Attachment", { Parent = Spectacle.crown })
+	end
+
+	local function buildAurora()
+		if Spectacle.auroraBuilt then
+			return
+		end
+		Spectacle.auroraBuilt = true
+		for curtain = 1, AURORA_CURTAINS[4] do
+			for index = 1, AURORA_RAYS[4] do
+				local a0, a1 = anchor(), anchor()
+				table.insert(Spectacle.rays, {
+					beam = skyBeam(a0, a1, { Segments = 10, Brightness = 1.6 }),
+					a0 = a0,
+					a1 = a1,
+					curtain = curtain,
+					index = index,
+					shape = random:NextInteger(1, #AURORA_REACH),
+					length = between(200, 380),
+					seed = between(0, 100),
+					level = 0,
+				})
+			end
+		end
+	end
+
+	local function hideRays()
+		for _, ray in Spectacle.rays do
+			if ray.level ~= 0 then
+				ray.level = 0
+				ray.beam.Enabled = false
+			end
+		end
+	end
+
+	local function updateAurora(dt)
+		local tier = Settings.tier("atmo.aurora")
+		if tier > 1 then
+			Spectacle.auroraTier = tier
+		end
+
+		-- When it shows: dark skies, plus daylight if "Daytime aurora" is on,
+		-- filtered by the Euphoria-style "Appears" condition.
+		local when = get("atmo.auroraWhen")
+		local condition = 1 - sim.overcast * 0.5
+		if when == 2 then
+			condition = clamp01(1 - sim.overcast * 1.4)
+		elseif when == 3 then
+			local snowy = math.max(sim.snow, get("world.season") == 5 and 1 or 0)
+			condition = snowy * (1 - sim.overcast * 0.4)
+		end
+		local dark = smoothstep(0.05, -0.12, F.sunHeight)
+		local daytime = get("atmo.auroraDay") and get("atmo.auroraDayStrength") or 0
+		local visibility = (dark + (1 - dark) * daytime) * condition * (1 - sim.underwater)
+		sim.aurora = approach(sim.aurora, tier > 1 and visibility or 0, 0.35, dt)
+
+		local palette = AURORA_PALETTES[get("atmo.auroraPalette")]
+		local brightness = get("atmo.auroraBrightness")
+		F.auroraColor = palette.glow
+		F.aurora = get("atmo.auroraGlow") and sim.aurora * dark * (0.4 + 0.6 * brightness) or 0
+
+		if sim.aurora < 0.004 then
+			if Spectacle.auroraShown then
+				Spectacle.auroraShown = false
+				hideRays()
+			end
+			return
+		end
+		buildAurora()
+		Spectacle.auroraShown = true
+		Spectacle.auroraClock += dt * (0.15 + 1.1 * get("atmo.auroraSpeed"))
+		-- The curtains drift slowly, so 15 updates a second is plenty.
+		if not every("aurora", 1 / 15, dt) then
+			return
+		end
+
+		local active = Spectacle.auroraTier or 2
+		local curtains = AURORA_CURTAINS[active]
+		local count = AURORA_RAYS[active]
+		local spacing = 2 * AURORA_SPAN / count
+		local width = spacing * 1.9
+		local coverage = get("atmo.auroraCoverage")
+		local t = Spectacle.auroraClock
+		-- Against a bright sky the curtains need more opacity and less additive
+		-- glow to stay visible; at night they are pure emitted light.
+		local master = sim.aurora * (0.35 + 0.9 * brightness) * lerp(1, 1.35, F.day)
+		local emission = lerp(1, 0.3, F.day)
+		local glow = lerp(1.8, 1, F.day)
+		for _, ray in Spectacle.rays do
+			local beam = ray.beam
+			local curtain = ray.curtain
+			if curtain > curtains or ray.index > count then
+				if ray.level ~= 0 then
+					ray.level = 0
+					beam.Enabled = false
+				end
+				continue
+			end
+			-- Curtain centre lines run east-west; coverage spreads them from a
+			-- band low in the north (-Z) to the whole sky.
+			local u = (curtain - 0.5) / curtains
+			local baseZ = -950 + u * (250 + 1350 * coverage)
+			local phase = curtain * 1.7
+			local x = -AURORA_SPAN + (ray.index - 0.5) * spacing
+			local z = baseZ
+				+ 80 * math.sin(t * 0.05 + phase)
+				+ 140 * math.sin(x / 380 + phase + t * 0.11)
+				+ 60 * math.sin(x / 130 + phase * 2.3 - t * 0.23)
+				+ 22 * math.sin(x / 47 + phase * 3.1 + t * 0.41)
+			local bottom = 230 + 30 * curtain + 25 * math.sin(x / 300 + t * 0.07 + phase)
+			-- Brightness surges travel along the curtain; rays flicker on top.
+			local surge = math.noise(x / 170 + t * 0.35, curtain * 3.1, 0.5) + 0.5
+			local flicker = math.noise(x / 37 - t * 1.6, curtain * 7.3, ray.seed) * 0.6
+			local edge = smoothstep(AURORA_SPAN, AURORA_SPAN * 0.7, math.abs(x))
+			local intensity = clamp01((0.25 + 0.85 * surge + flicker) * edge * master)
+			local level = math.floor(intensity * AURORA_LEVELS + 0.5)
+			if level == 0 then
+				if ray.level ~= 0 then
+					ray.level = 0
+					beam.Enabled = false
+				end
+			else
+				ray.a0.Position = Vector3.new(x, bottom, z)
+				-- Rays lean slightly along the magnetic field lines.
+				ray.a1.Position = Vector3.new(x, bottom + ray.length, z - ray.length * 0.12)
+				if ray.level ~= level then
+					if ray.level == 0 then
+						beam.Enabled = true
+					end
+					ray.level = level
+					beam.Transparency = auroraCurves[ray.shape][level]
+				end
+				put(beam, "Width0", width, 1)
+				put(beam, "Width1", width * 1.25, 1)
+				put(beam, "Color", palette.sequence)
+				put(beam, "LightEmission", emission, 0.02)
+				put(beam, "Brightness", glow, 0.02)
+			end
+		end
+	end
+
+	----------------------------------------------------------------------------
+	-- Milky Way: a faint, mottled band across the night sky. Three curved
+	-- beams trace half of a great circle (the part above the horizon), each
+	-- with a wide soft haze and a narrower brighter core. The smoke texture,
+	-- tiled along the band, breaks it into the patchy look of star clouds.
+	-- The band turns with the clock, once a day around a tilted pole.
+	----------------------------------------------------------------------------
+
+	local GALAXY_RADIUS = 900
+	local GALAXY_POLE = Vector3.new(0.3, 0.75, -0.59).Unit
+	local GALAXY_ARCS = 3
+
+	local function buildGalaxy()
+		if #Spectacle.galaxy > 0 then
+			return
+		end
+		local haze = colorSequence({ { 0, rgb(150, 160, 255) }, { 0.5, rgb(215, 195, 255) }, { 1, rgb(150, 160, 255) } })
+		local core = ColorSequence.new(rgb(255, 238, 215))
+		for arc = 1, GALAXY_ARCS do
+			for layer = 1, 2 do
+				local a0, a1 = anchor(), anchor()
+				local beam = skyBeam(a0, a1, {
+					Segments = 24,
+					Width0 = layer == 1 and 170 or 60,
+					Width1 = layer == 1 and 170 or 60,
+					Color = layer == 1 and haze or core,
+					Texture = CONFIG.ParticleTexture,
+					TextureMode = Enum.TextureMode.Wrap,
+					TextureLength = layer == 1 and 260 or 120,
+					Brightness = 1.2,
+				})
+				table.insert(Spectacle.galaxy, { beam = beam, a0 = a0, a1 = a1, arc = arc, layer = layer })
+			end
+		end
+	end
+
+	local function placeGalaxy()
+		local spin = sim.clock / 24 * math.pi * 2
+		local e1 = GALAXY_POLE:Cross(Vector3.xAxis).Unit
+		local e2 = GALAXY_POLE:Cross(e1).Unit
+		local a = e1 * math.cos(spin) + e2 * math.sin(spin)
+		local b = GALAXY_POLE:Cross(a)
+		-- Centre the visible half on the band's highest point.
+		local top = math.atan2(b.Y, a.Y)
+		local span = math.rad(200) / GALAXY_ARCS
+		local control = 4 / 3 * math.tan(span / 4) * GALAXY_RADIUS
+		for _, entry in Spectacle.galaxy do
+			local from = top - math.rad(100) + (entry.arc - 1) * span
+			local to = from + span
+			local p0 = (a * math.cos(from) + b * math.sin(from)) * GALAXY_RADIUS
+			local p1 = (a * math.cos(to) + b * math.sin(to)) * GALAXY_RADIUS
+			local t0 = -a * math.sin(from) + b * math.cos(from)
+			local t1 = -a * math.sin(to) + b * math.cos(to)
+			-- A cubic Bezier with these handles follows the circle closely.
+			entry.a0.CFrame = CFrame.fromMatrix(p0, t0, GALAXY_POLE)
+			entry.a1.CFrame = CFrame.fromMatrix(p1, t1, GALAXY_POLE)
+			entry.beam.CurveSize0 = control
+			entry.beam.CurveSize1 = control
+		end
+	end
+
+	local function updateGalaxy(dt)
+		local alpha = get("atmo.milkyWay") * sim.stars * (1 - F.aurora * 0.5)
+		if alpha < 0.005 then
+			if Spectacle.galaxyShown then
+				Spectacle.galaxyShown = false
+				for _, entry in Spectacle.galaxy do
+					entry.beam.Enabled = false
+				end
+			end
+			return
+		end
+		buildGalaxy()
+		if not Spectacle.galaxyShown then
+			Spectacle.galaxyShown = true
+			sim.timers.galaxy = nil -- place it straight away
+			for _, entry in Spectacle.galaxy do
+				entry.beam.Enabled = true
+			end
+		end
+		if every("galaxy", 4, dt) then
+			placeGalaxy()
+		end
+		for _, entry in Spectacle.galaxy do
+			local strength = entry.layer == 1 and 0.16 or 0.22
+			putSequence(entry.beam, "Transparency", 1 - strength * alpha, 0.004)
+		end
+	end
+
+	----------------------------------------------------------------------------
+	-- Shooting stars. Each is a short beam on the sky sphere whose head runs
+	-- along a great circle and whose tail follows a few degrees behind. The
+	-- envelope rises and falls over the meteor's life, and the head is hot
+	-- white while the trail keeps the chosen colour (the green of a real
+	-- meteor's ionised oxygen, gold, and so on). "Meteor shower" fixes one
+	-- radiant per night that every streak flies away from.
+	----------------------------------------------------------------------------
+
+	local METEOR_POOL = 6
+	local METEOR_RADIUS = 750
+	local METEOR_COLORS = {
+		rgb(200, 220, 255),
+		rgb(110, 255, 160),
+		rgb(255, 200, 110),
+		rgb(140, 210, 255),
+		rgb(255, 140, 190),
+	}
+	local WHITE = rgb(255, 255, 255)
+
+	local function buildMeteors()
+		if #Spectacle.meteors > 0 then
+			return
+		end
+		for _ = 1, METEOR_POOL do
+			local a0, a1 = anchor(), anchor()
+			local beam = skyBeam(a0, a1, { Segments = 6, Width0 = 0.3, Width1 = 3, Brightness = 3 })
+			table.insert(Spectacle.meteors, { beam = beam, a0 = a0, a1 = a1, active = false })
+		end
+	end
+
+	local function spawnMeteor()
+		buildMeteors()
+		local meteor = nil
+		for _, candidate in Spectacle.meteors do
+			if not candidate.active then
+				meteor = candidate
+				break
+			end
+		end
+		if not meteor then
+			return
+		end
+		local start, tangent
+		if get("atmo.meteorShower") then
+			if not Spectacle.radiant or Spectacle.radiantNight ~= math.floor(sim.time / 600) then
+				Spectacle.radiantNight = math.floor(sim.time / 600)
+				local azimuth = between(0, math.pi * 2)
+				Spectacle.radiant = Vector3.new(math.cos(azimuth) * 0.64, 0.77, math.sin(azimuth) * 0.64)
+			end
+			local radiant = Spectacle.radiant
+			-- Start somewhere 15-60 degrees from the radiant, heading away.
+			local away = (Vector3.new(between(-1, 1), between(-1, 0.3), between(-1, 1)) - radiant * 0.2)
+			away = (away - radiant * away:Dot(radiant))
+			if away.Magnitude < 0.01 then
+				return
+			end
+			local offset = between(0.26, 1.05)
+			start = (radiant * math.cos(offset) + away.Unit * math.sin(offset)).Unit
+			tangent = start - radiant * start:Dot(radiant)
+			tangent = (tangent - start * tangent:Dot(start))
+		else
+			local azimuth = between(0, math.pi * 2)
+			local elevation = math.rad(between(22, 70))
+			start = Vector3.new(math.cos(elevation) * math.cos(azimuth), math.sin(elevation), math.cos(elevation) * math.sin(azimuth))
+			local wander = Vector3.new(between(-1, 1), -0.6 - between(0, 0.8), between(-1, 1))
+			tangent = wander - start * wander:Dot(start)
+		end
+		if start.Y < 0.12 or tangent.Magnitude < 0.01 then
+			return
+		end
+		local speed = get("atmo.meteorSpeed")
+		meteor.active = true
+		meteor.start = start
+		meteor.tangent = tangent.Unit
+		meteor.age = 0
+		meteor.duration = between(0.5, 1.1) / speed
+		meteor.rate = between(0.35, 0.6) * speed -- radians per second
+		meteor.trail = 0.12 * get("atmo.meteorLength")
+		meteor.color = METEOR_COLORS[get("atmo.meteorColor")]
+		meteor.beam.Color = colorSequence({ { 0, meteor.color }, { 0.7, meteor.color:Lerp(WHITE, 0.4) }, { 1, WHITE } })
+		meteor.beam.Enabled = true
+	end
+
+	local function skyPoint(start, tangent, angle)
+		return (start * math.cos(angle) + tangent * math.sin(angle)) * METEOR_RADIUS
+	end
+
+	local function updateMeteors(dt)
+		local live = 0
+		local brightness = get("atmo.meteorBrightness")
+		for _, meteor in Spectacle.meteors do
+			if meteor.active then
+				meteor.age += dt
+				local progress = meteor.age / meteor.duration
+				if progress >= 1 then
+					meteor.active = false
+					meteor.beam.Enabled = false
+				else
+					live += 1
+					local head = meteor.rate * meteor.age
+					local tail = math.max(0, head - meteor.trail * math.min(1, progress * 3))
+					meteor.a0.Position = skyPoint(meteor.start, meteor.tangent, tail)
+					meteor.a1.Position = skyPoint(meteor.start, meteor.tangent, head)
+					local envelope = math.sin(math.pi * progress) ^ 0.7 * brightness * sim.stars
+					meteor.beam.Transparency = numberSequence({
+						{ 0, 1 },
+						{ 0.6, 1 - 0.35 * envelope },
+						{ 0.95, 1 - 0.95 * envelope },
+						{ 1, 1 - 0.6 * envelope },
+					})
+				end
+			end
+		end
+		Spectacle.meteorsLive = live
+
+		-- A Poisson process: the chance of a meteor this frame is rate * dt.
+		if get("atmo.meteors") and sim.stars > 0.2 then
+			local perMinute = get("atmo.meteorRate") * (get("atmo.meteorShower") and 4 or 1)
+			if random:NextNumber() < perMinute / 60 * sim.stars * dt then
+				spawnMeteor()
+			end
+		end
+	end
+
+	----------------------------------------------------------------------------
+	-- Rainbows (Euphoria Patches). A rainbow is a circle of 42 degrees around
+	-- the point directly opposite the sun, red outside and violet inside,
+	-- with a fainter secondary bow at 51 degrees in reverse order. It shows
+	-- when the sun is low and behind you and the air is still full of drops,
+	-- which is to say as the rain clears. Each colour band is drawn as eight
+	-- curved beam segments around the circle.
+	----------------------------------------------------------------------------
+
+	local RAINBOW_DISTANCE = 480
+	local RAINBOW_SEGMENTS = 8
+	local RAINBOW_BANDS = {
+		{ radius = 42.0, color = rgb(255, 60, 50), weight = 1 },
+		{ radius = 41.6, color = rgb(255, 150, 40), weight = 1 },
+		{ radius = 41.25, color = rgb(255, 235, 80), weight = 1 },
+		{ radius = 40.9, color = rgb(80, 230, 90), weight = 1 },
+		{ radius = 40.5, color = rgb(60, 140, 255), weight = 1 },
+		{ radius = 40.1, color = rgb(140, 80, 230), weight = 0.9 },
+		{ radius = 50.4, color = rgb(110, 100, 255), weight = 0.35 },
+		{ radius = 51.1, color = rgb(90, 220, 110), weight = 0.35 },
+		{ radius = 51.8, color = rgb(255, 90, 60), weight = 0.35 },
+	}
+
+	local function buildRainbow()
+		if #Spectacle.bands > 0 then
+			return
+		end
+		local width = RAINBOW_DISTANCE * math.tan(math.rad(0.55))
+		for _, band in RAINBOW_BANDS do
+			for segment = 1, RAINBOW_SEGMENTS do
+				local a0, a1 = anchor(), anchor()
+				local beam = skyBeam(a0, a1, {
+					Segments = 16,
+					Width0 = width,
+					Width1 = width,
+					Color = ColorSequence.new(band.color),
+					LightEmission = 0.7,
+				})
+				table.insert(Spectacle.bands, { beam = beam, a0 = a0, a1 = a1, band = band, segment = segment, shown = false })
+			end
+		end
+	end
+
+	local function placeRainbow()
+		local antisolar = -F.sun
+		local u = antisolar:Cross(Vector3.yAxis)
+		if u.Magnitude < 0.01 then
+			return
+		end
+		u = u.Unit
+		local v = u:Cross(antisolar).Unit
+		if v.Y < 0 then
+			v = -v
+		end
+		local step = math.pi * 2 / RAINBOW_SEGMENTS
+		for _, entry in Spectacle.bands do
+			local radius = math.rad(entry.band.radius)
+			local ring = RAINBOW_DISTANCE * math.sin(radius)
+			local from = (entry.segment - 1) * step
+			local to = from + step
+			local function point(angle)
+				local direction = antisolar * math.cos(radius) + (u * math.cos(angle) + v * math.sin(angle)) * math.sin(radius)
+				return direction * RAINBOW_DISTANCE, direction, -u * math.sin(angle) + v * math.cos(angle)
+			end
+			local p0, n0, t0 = point(from)
+			local p1, n1, t1 = point(to)
+			local middle = point((from + to) / 2)
+			-- Segments wholly below the horizon are skipped.
+			entry.visible = middle.Y > -RAINBOW_DISTANCE * 0.08
+			entry.a0.CFrame = CFrame.fromMatrix(p0, t0, n0)
+			entry.a1.CFrame = CFrame.fromMatrix(p1, t1, n1)
+			local control = 4 / 3 * math.tan(step / 4) * ring
+			entry.beam.CurveSize0 = control
+			entry.beam.CurveSize1 = control
+		end
+	end
+
+	local function updateRainbow(dt)
+		local target = 0
+		if get("world.rainbows") and sim.rainMemory > 0 then
+			local sunLow = smoothstep(0, 0.06, F.sunHeight) * smoothstep(0.62, 0.45, F.sunHeight)
+			target = sim.rainMemory * (1 - sim.rain * 0.75) * clamp01((1 - sim.overcast) * 1.5) * sunLow * (1 - sim.underwater)
+		end
+		sim.rainbow = approach(sim.rainbow, target, 0.3, dt)
+		if sim.rainbow < 0.004 then
+			if Spectacle.rainbowShown then
+				Spectacle.rainbowShown = false
+				for _, entry in Spectacle.bands do
+					entry.shown = false
+					entry.beam.Enabled = false
+				end
+			end
+			return
+		end
+		buildRainbow()
+		if not Spectacle.rainbowShown then
+			Spectacle.rainbowShown = true
+			sim.timers.rainbow = nil
+		end
+		if every("rainbow", 1, dt) then
+			placeRainbow()
+		end
+		for _, entry in Spectacle.bands do
+			local shown = entry.visible == true
+			if shown ~= entry.shown then
+				entry.shown = shown
+				entry.beam.Enabled = shown
+			end
+			if shown then
+				putSequence(entry.beam, "Transparency", 1 - 0.55 * sim.rainbow * entry.band.weight, 0.004)
+			end
+		end
+	end
+
+	----------------------------------------------------------------------------
+	-- Lightning bolts. Each strike draws a jagged channel from the cloud base
+	-- to the ground a few hundred studs away, with a few forks, all lit by the
+	-- same flash value that brightens the sky (including the re-strike).
+	----------------------------------------------------------------------------
+
+	local BOLT_POOL = 24
+
+	local function buildBolt()
+		if #Spectacle.bolt > 0 then
+			return
+		end
+		local color = ColorSequence.new(rgb(232, 228, 255))
+		for _ = 1, BOLT_POOL do
+			local a0 = create("Attachment", { Parent = Spectacle.boltAnchor })
+			local a1 = create("Attachment", { Parent = Spectacle.boltAnchor })
+			local beam = create("Beam", {
+				Attachment0 = a0,
+				Attachment1 = a1,
+				FaceCamera = true,
+				Segments = 1,
+				LightInfluence = 0,
+				LightEmission = 1,
+				Brightness = 8,
+				Color = color,
+				Transparency = NumberSequence.new(1),
+				Enabled = false,
+				Parent = Spectacle.boltAnchor,
+			})
+			table.insert(Spectacle.bolt, { beam = beam, a0 = a0, a1 = a1, used = false, width = 1 })
+		end
+	end
+
+	local function strike()
+		buildBolt()
+		local angle = between(0, math.pi * 2)
+		local distance = between(250, 700)
+		local base = F.camPos + Vector3.new(math.cos(angle) * distance, 0, math.sin(angle) * distance)
+		local top = base + Vector3.new(0, 380, 0)
+		local hit = Workspace:Raycast(top, Vector3.new(0, -900, 0), sim.rayParams)
+		local groundY = hit and hit.Position.Y or (F.camPos.Y - 30)
+		Spectacle.boltAnchor.CFrame = CFrame.new(top)
+		local height = top.Y - groundY
+
+		local used = 0
+		local function segment(from, to, width)
+			used += 1
+			local entry = Spectacle.bolt[used]
+			if not entry then
+				return
+			end
+			entry.a0.Position = from
+			entry.a1.Position = to
+			entry.width = width
+			entry.used = true
+		end
+		-- Main channel, in anchor space (top at the origin).
+		local points = { Vector3.zero }
+		local steps = 12
+		for step = 1, steps do
+			local previous = points[step]
+			local y = -height * step / steps
+			local jitter = step == steps and 0 or 26
+			points[step + 1] = Vector3.new(previous.X + between(-jitter, jitter), y, previous.Z + between(-jitter, jitter))
+			segment(previous, points[step + 1], 2.6 - step * 0.08)
+		end
+		-- Forks branch off the upper two thirds and die out.
+		for _ = 1, 3 do
+			local origin = points[random:NextInteger(2, 8)]
+			local direction = Vector3.new(between(-1, 1), -between(0.6, 1.2), between(-1, 1)).Unit
+			local from = origin
+			for _ = 1, 4 do
+				local to = from + direction * between(20, 40) + Vector3.new(between(-8, 8), 0, between(-8, 8))
+				segment(from, to, 1)
+				from = to
+			end
+		end
+		for index = used + 1, #Spectacle.bolt do
+			Spectacle.bolt[index].used = false
+		end
+		Spectacle.boltShown = true
+	end
+
+	local function updateBolts()
+		if sim.strikeQueued then
+			sim.strikeQueued = false
+			if get("world.lightningBolts") then
+				strike()
+			end
+		end
+		if not Spectacle.boltShown then
+			return
+		end
+		local alpha = clamp01(sim.flash * 1.3) * (0.75 + 0.25 * random:NextNumber())
+		if alpha < 0.05 then
+			Spectacle.boltShown = false
+			for _, entry in Spectacle.bolt do
+				entry.beam.Enabled = false
+			end
+			return
+		end
+		local transparency = NumberSequence.new(1 - alpha)
+		for _, entry in Spectacle.bolt do
+			entry.beam.Enabled = entry.used
+			if entry.used then
+				entry.beam.Transparency = transparency
+				entry.beam.Width0 = entry.width
+				entry.beam.Width1 = entry.width * 0.8
+			end
+		end
+	end
+
+	----------------------------------------------------------------------------
+
+	function Spectacle.start()
+		Spectacle.crown = hiddenPart("SkyAnchor", Vector3.one, Fx.world)
+		Spectacle.boltAnchor = hiddenPart("BoltAnchor", Vector3.one, Fx.world)
+		Spectacle.auroraBuilt = false
+		Spectacle.auroraShown = false
+		Spectacle.auroraClock = random:NextNumber() * 1000
+		Spectacle.auroraTier = nil
+		Spectacle.galaxyShown = false
+		Spectacle.rainbowShown = false
+		Spectacle.boltShown = false
+		Spectacle.meteorsLive = 0
+		Spectacle.radiant = nil
+		table.clear(Spectacle.rays)
+		table.clear(Spectacle.galaxy)
+		table.clear(Spectacle.meteors)
+		table.clear(Spectacle.bands)
+		table.clear(Spectacle.bolt)
+	end
+
+	function Stage.sky(dt)
+		local visible = sim.aurora > 0.004 or Spectacle.galaxyShown or Spectacle.meteorsLive > 0 or sim.rainbow > 0.004
+		if visible then
+			Spectacle.crown.CFrame = CFrame.new(F.camPos)
+		end
+		updateAurora(dt)
+		updateGalaxy(dt)
+		updateMeteors(dt)
+		updateRainbow(dt)
+		updateBolts()
+	end
+end
+
+--------------------------------------------------------------------------------
+-- 11. LIGHT SOURCES, HALOS AND CONTACT SHADOWS
+--     Under Future lighting, PointLights, SpotLights and SurfaceLights can
+--     cast real shadows, which is the closest Roblox gets to the coloured
+--     block-light of a shader pack. It is also the most expensive thing in
+--     this script, so it is rationed: lights are ranked by distance from the
+--     camera twice a second and only the nearest N (by tier, and within the
+--     "Shadow distance" threshold) get shadows. Original values are
+--     remembered per light and put back when released.
+--
+--     Voxel ports. Two Future-only looks are recreated for the Voxel and
+--     ShadowMap pipelines: the bright HDR glow around lamps (halos, a soft
+--     sprite at each of the nearest lights) and crisp shadows under
+--     characters (contact shadows, a soft decal on the ground beneath them).
+--------------------------------------------------------------------------------
+
+local Lights: { [string]: any } = {
+	records = {}, -- light -> record
+	ranked = {}, -- records sorted by distance, rebuilt on each rescan
+	tuned = 0, -- how many of the nearest lights have brightness under our control
+	halos = {},
+}
+
+do
+	local TUNE_BUDGET = 32
+	local HALO_COUNT = { 0, 8, 20 }
+	local WARM = rgb(255, 186, 112)
+	local COOL = rgb(166, 204, 255)
+
+	local function positionOf(light)
+		local parent = light.Parent
+		if not parent then
+			return nil
+		end
+		if parent:IsA("Attachment") then
+			return parent.WorldPosition
+		elseif parent:IsA("BasePart") then
+			return parent.Position
+		end
+		return nil
+	end
+
+	function Lights.track(instance)
+		if not Lights.records[instance] then
+			Lights.records[instance] = {
+				light = instance,
+				shadows = instance.Shadows,
+				brightness = instance.Brightness,
+				color = instance.Color,
+				seed = math.random() * 1000,
+				distance = math.huge,
+				shadowForced = false,
+				tuned = false,
+			}
+		end
+	end
+
+	function Lights.untrack(instance)
+		Lights.records[instance] = nil
+	end
+
+	local function untune(record)
+		if record.tuned then
+			record.tuned = false
+			record.light.Brightness = record.brightness
+			record.light.Color = record.color
+		end
+	end
+
+	local function release(record)
+		if record.shadowForced then
+			record.shadowForced = false
+			record.light.Shadows = record.shadows
+		end
+		untune(record)
+	end
+
+	function Lights.stop()
+		for _, record in Lights.records do
+			release(record)
+		end
+		table.clear(Lights.records)
+		table.clear(Lights.ranked)
+		table.clear(Lights.halos)
+		Lights.tuned = 0
+	end
+
+	local function byDistance(a, b)
+		return a.distance < b.distance
+	end
+
+	local function makeHalo()
+		local attachment = create("Attachment", { Name = "Halo", Parent = Lights.haloAnchor })
+		local emitter = create("ParticleEmitter", {
+			Name = "Halo",
+			Enabled = false,
+			Rate = 4,
+			Texture = CONFIG.ParticleTexture,
+			Lifetime = NumberRange.new(1),
+			Speed = NumberRange.new(0),
+			LockedToPart = true,
+			-- Overlapping, slowly cycling sprites read as one steady glow.
+			Transparency = numberSequence({ { 0, 1 }, { 0.25, 0.8 }, { 0.75, 0.8 }, { 1, 1 } }),
+			LightEmission = 1,
+			LightInfluence = 0,
+			Brightness = 1.5,
+			-- Drawn a little towards the camera so the lamp's own mesh does
+			-- not swallow it.
+			ZOffset = 1,
+			Parent = attachment,
+		})
+		return { attachment = attachment, emitter = emitter, record = nil }
+	end
+
+	local function rescan()
+		local ranked = Lights.ranked
+		table.clear(ranked)
+		for light, record in Lights.records do
+			local position = light.Enabled and positionOf(light) or nil
+			if position then
+				record.distance = (position - F.camPos).Magnitude
+				table.insert(ranked, record)
+			else
+				release(record)
+			end
+		end
+		table.sort(ranked, byDistance)
+
+		local shadowBudget = Caps.localLightShadows and Look.lightShadowBudget[Settings.tier("mat.lightShadows")] or 0
+		local shadowRange = get("mat.shadowRange")
+		local wantsTuning = get("mat.lightBoost") ~= 1 or get("mat.lightFlicker") > 0 or get("mat.lightWarmth") ~= 0
+		local tuneBudget = wantsTuning and TUNE_BUDGET or 0
+		Lights.tuned = math.min(tuneBudget, #ranked)
+
+		for rank, record in ranked do
+			local wantShadow = rank <= shadowBudget and record.distance <= shadowRange
+			if wantShadow ~= record.shadowForced then
+				record.shadowForced = wantShadow
+				-- Never switch off a shadow the place asked for itself.
+				record.light.Shadows = wantShadow or record.shadows
+			end
+			if rank <= tuneBudget then
+				record.tuned = true
+			else
+				untune(record)
+			end
+		end
+
+		-- Halos go to the nearest lights that actually give light.
+		local haloCount = HALO_COUNT[Settings.tier("mat.halos")]
+		local halos = Lights.halos
+		while #halos < haloCount do
+			table.insert(halos, makeHalo())
+		end
+		local slot = 0
+		for _, record in ranked do
+			if slot >= haloCount then
+				break
+			end
+			local light = record.light
+			if light.Brightness > 0 and light.Range > 0 then
+				slot += 1
+				local halo = halos[slot]
+				if halo.record ~= record then
+					halo.record = record
+					halo.emitter.Color = ColorSequence.new(light.Color)
+					halo.size = math.clamp(light.Range / 12, 0.6, 2.5)
+				end
+			end
+		end
+		for index = slot + 1, #halos do
+			halos[index].record = nil
+		end
+	end
+
+	function Lights.update(dt)
+		if every("lights", 0.5, dt) then
+			rescan()
+		end
+
+		-- Halos follow their lights every frame (lamps can move) and dim in
+		-- daylight, when a lamp's glow is lost against the sky.
+		local haloSize = 0.6 + 1.6 * get("mat.haloSize")
+		local haloGlow = lerp(1.6, 0.5, F.day)
+		for _, halo in Lights.halos do
+			local record = halo.record
+			local position = record and positionOf(record.light)
+			local on = position ~= nil
+			put(halo.emitter, "Enabled", on)
+			if on then
+				halo.attachment.WorldPosition = position
+				putSequence(halo.emitter, "Size", haloSize * halo.size, 0.02)
+				put(halo.emitter, "Brightness", haloGlow, 0.05)
+			end
+		end
+
+		if Lights.tuned == 0 then
+			return
+		end
+		local boost = get("mat.lightBoost")
+		local flicker = get("mat.lightFlicker")
+		local warmth = get("mat.lightWarmth")
+		local time = sim.time
+		for rank = 1, Lights.tuned do
+			local record = Lights.ranked[rank]
+			if record and record.tuned then
+				-- Two octaves of noise: a slow sway with a fast shimmer on it.
+				local waver = 0
+				if flicker > 0 then
+					waver = math.noise(time * 2.3, record.seed) * 0.5 + math.noise(time * 9.1, record.seed) * 0.25
+				end
+				local brightness = record.brightness * boost * (1 + flicker * waver)
+				if math.abs(record.light.Brightness - brightness) > 0.01 then
+					record.light.Brightness = brightness
+				end
+				local color = record.color
+				if warmth > 0 then
+					color = color:Lerp(multiplyColor(color, WARM), warmth * 0.7)
+				elseif warmth < 0 then
+					color = color:Lerp(multiplyColor(color, COOL), -warmth * 0.7)
+				end
+				put(record.light, "Color", color)
+			end
+		end
+	end
+
+	function Lights.start()
+		Lights.haloAnchor = hiddenPart("HaloAnchor", Vector3.one, Fx.world)
+		Lights.haloAnchor.CFrame = CFrame.new()
+	end
+end
+
+local Contact: { [string]: any } = { pool = {}, characters = {}, params = RaycastParams.new() }
+Contact.params.FilterType = Enum.RaycastFilterType.Exclude
+Contact.params.IgnoreWater = false
+
+do
+	local POOL = 8
+	local RANGE = 120
+
+	local function makeShadow()
+		local part = hiddenPart("ContactShadow", Vector3.new(4, 0.05, 4), Fx.world)
+		local decal = create("Decal", {
+			Face = Enum.NormalId.Top,
+			Color3 = rgb(0, 0, 0),
+			Transparency = 1,
+			Texture = CONFIG.ParticleTexture,
+			Parent = part,
+		})
+		-- A generated radial blob is softer and rounder than the stock
+		-- particle texture, so it is used whenever the image API allows.
+		if Contact.blob then
+			writeProperty(decal, "TextureContent", Content.fromObject(Contact.blob))
+		end
+		return { part = part, decal = decal }
+	end
+
+	function Contact.start()
+		table.clear(Contact.pool)
+		table.clear(Contact.characters)
+		Contact.blob = nil
+		if Caps.editableImage then
+			Contact.blob = paintTexture(64, function(x, y)
+				local nx = (x + 0.5) / 32 - 1
+				local ny = (y + 0.5) / 32 - 1
+				local alpha = 1 - smoothstep(0.15, 1, math.sqrt(nx * nx + ny * ny))
+				return 255, 255, 255, math.floor(alpha * alpha * 255)
+			end)
+		end
+	end
+
+	function Contact.stop()
+		if Contact.blob then
+			Contact.blob:Destroy()
+			Contact.blob = nil
+		end
+		table.clear(Contact.pool)
+		table.clear(Contact.characters)
+	end
+
+	local function hideAll()
+		for _, shadow in Contact.pool do
+			put(shadow.decal, "Transparency", 1)
+		end
+	end
+
+	function Contact.update(dt)
+		local enabled = get("mat.contactShadows") and Caps.nonFuture
+		if not enabled then
+			if Contact.shown then
+				Contact.shown = false
+				hideAll()
+			end
+			return
+		end
+		Contact.shown = true
+
+		-- Which characters are close enough to bother with, nearest first.
+		if every("contactScan", 0.5, dt) then
+			local characters = Contact.characters
+			table.clear(characters)
+			local ignore = { Fx.world }
+			for _, player in Players:GetPlayers() do
+				local character = player.Character
+				local root = character and character:FindFirstChild("HumanoidRootPart")
+				if root then
+					table.insert(ignore, character)
+					local distance = (root.Position - F.camPos).Magnitude
+					if distance < RANGE then
+						table.insert(characters, { root = root, distance = distance })
+					end
+				end
+			end
+			table.sort(characters, function(a, b)
+				return a.distance < b.distance
+			end)
+			Contact.params.FilterDescendantsInstances = ignore
+			while #Contact.pool < math.min(#characters, POOL) do
+				table.insert(Contact.pool, makeShadow())
+			end
+		end
+
+		local strength = get("mat.contactStrength")
+		for index, shadow in Contact.pool do
+			local entry = Contact.characters[index]
+			local root = entry and entry.root
+			local visible = false
+			if root and root.Parent then
+				local hit = Workspace:Raycast(root.Position, Vector3.new(0, -14, 0), Contact.params)
+				if hit then
+					-- Standing, the root sits about three studs up. Higher than
+					-- that (jumping, falling) the shadow spreads and fades.
+					local height = math.max(0, root.Position.Y - hit.Position.Y - 3)
+					local fade = clamp01(1 - height / 9)
+					if fade > 0.01 then
+						visible = true
+						local normal = hit.Normal
+						local across = math.abs(normal.Y) < 0.99 and normal:Cross(Vector3.yAxis).Unit or Vector3.xAxis
+						local width = 2.1 * root.Size.X * (1 + height * 0.08)
+						shadow.part.Size = Vector3.new(width, 0.05, width)
+						shadow.part.CFrame = CFrame.fromMatrix(hit.Position + normal * 0.04, across, normal)
+						put(shadow.decal, "Transparency", 1 - strength * 0.75 * fade, 0.01)
+					end
+				end
+			end
+			if not visible then
+				put(shadow.decal, "Transparency", 1)
+			end
+		end
+	end
+end
+
+--------------------------------------------------------------------------------
+-- 12. SURFACES: REFLECTANCE FOR EVERY MATERIAL
+--     Roblox only gives smooth materials a visible reflection; shader packs
+--     give every surface a sheen that suits it (polished marble, a faint
+--     gloss on wood, almost nothing on fabric) and make anything rained on
+--     glossier. This module does that with Part.Reflectance, which reflects
+--     the sky in every lighting pipeline.
+--
+--     Cost control: parts are discovered with one spatial query around the
+--     camera every 1.5 seconds (radius by tier), adopted at most 30 per frame
+--     (each with one upward ray to see whether rain can reach it), and when
+--     the sheen or the wetness changes, re-written 150 per frame. Parts the
+--     game already gave a reflectance, transparent parts, characters and
+--     surface-appearance meshes are left alone. Originals are restored when
+--     the option or the shaders are switched off.
+--------------------------------------------------------------------------------
+
+local Surfaces: { [string]: any } = { list = {}, index = {}, queue = {}, skip = setmetatable({}, { __mode = "k" }) }
+
+do
+	local SCAN_RADIUS = { 0, 70, 140, 260 }
+	local ADOPT_PER_FRAME = 30
+	local REFRESH_PER_FRAME = 150
+
+	-- Base sheen (reflectance at the default "Sheen" of 50%) and how much a
+	-- material darkens and glosses over when wet (porous ones the most).
+	local MATERIALS = {
+		Plastic = { 0.03, 0.8 },
+		SmoothPlastic = { 0.08, 0.6 },
+		Wood = { 0.02, 0.7 },
+		WoodPlanks = { 0.025, 0.8 },
+		Marble = { 0.12, 0.6 },
+		Granite = { 0.06, 0.8 },
+		Slate = { 0.04, 1 },
+		Concrete = { 0.02, 1 },
+		Brick = { 0.015, 0.9 },
+		Cobblestone = { 0.025, 1 },
+		Pebble = { 0.03, 0.9 },
+		Metal = { 0.22, 0.5 },
+		CorrodedMetal = { 0.06, 0.7 },
+		DiamondPlate = { 0.2, 0.6 },
+		Foil = { 0.3, 0.4 },
+		Ice = { 0.25, 0.3 },
+		Glacier = { 0.2, 0.3 },
+		Glass = { 0.18, 0.3 },
+		Sand = { 0.01, 0.4 },
+		Grass = { 0.01, 0.3 },
+		LeafyGrass = { 0.01, 0.3 },
+		Ground = { 0.01, 0.6 },
+		Mud = { 0.04, 0.8 },
+		Snow = { 0.03, 0.2 },
+		Asphalt = { 0.03, 1.1 },
+		Pavement = { 0.03, 1 },
+		Basalt = { 0.04, 0.9 },
+		Rock = { 0.03, 0.9 },
+		Salt = { 0.04, 0.5 },
+		Limestone = { 0.03, 0.9 },
+		Sandstone = { 0.02, 0.9 },
+		CrackedLava = { 0.02, 0.5 },
+		Plaster = { 0.03, 0.8 },
+		Leather = { 0.04, 0.6 },
+		Rubber = { 0.03, 0.6 },
+		ClayRoofTiles = { 0.04, 0.9 },
+		RoofShingles = { 0.02, 0.9 },
+		CeramicTiles = { 0.1, 0.7 },
+		Carpet = { 0, 0 },
+		Fabric = { 0, 0 },
+		Cardboard = { 0, 0 },
+	}
+	local SHEEN = {}
+	for name, values in MATERIALS do
+		-- Newer materials are looked up by name so older engines simply skip them.
+		local ok, material = pcall(function()
+			return (Enum.Material :: any)[name]
+		end)
+		if ok and material then
+			SHEEN[material] = values
+		end
+	end
+
+	local overlap = OverlapParams.new()
+	overlap.FilterType = Enum.RaycastFilterType.Exclude
+	overlap.MaxParts = 3000
+
+	local function eligible(part)
+		if part == Fx.terrain or part.Reflectance ~= 0 or part.Transparency > 0.9 then
+			return nil
+		end
+		local values = SHEEN[part.Material]
+		if not values or values[1] <= 0 then
+			return nil
+		end
+		if part:GetAttribute(OWNED_ATTRIBUTE) or part:FindFirstChildOfClass("SurfaceAppearance") then
+			return nil
+		end
+		return values
+	end
+
+	local function targetFor(record, amount, wetSheen)
+		local value = record.sheen * amount * 2
+		if record.exposed then
+			value += wetSheen * 0.16 * record.porous
+		end
+		return math.min(value, 0.6)
+	end
+
+	local function apply(record, amount, wetSheen)
+		local target = targetFor(record, amount, wetSheen)
+		if math.abs(target - record.applied) > 0.004 then
+			record.applied = target
+			record.part.Reflectance = target
+		end
+	end
+
+	function Surfaces.releaseAll()
+		for _, record in Surfaces.list do
+			if record.part.Parent then
+				record.part.Reflectance = record.original
+			end
+		end
+		table.clear(Surfaces.list)
+		table.clear(Surfaces.index)
+		-- Queued parts were marked as seen; unmark them so a later scan can
+		-- pick them up again.
+		for _, part in Surfaces.queue do
+			Surfaces.skip[part] = nil
+		end
+		table.clear(Surfaces.queue)
+		Surfaces.cursor = nil
+		Surfaces.appliedKey = nil
+	end
+
+	function Surfaces.update(dt)
+		local tier = Settings.tier("mat.reflect")
+		if tier == 1 then
+			if #Surfaces.list > 0 or #Surfaces.queue > 0 then
+				Surfaces.releaseAll()
+			end
+			return
+		end
+
+		-- 1. Discover parts around the camera.
+		if every("reflectScan", 1.5, dt) then
+			local ignore = { Fx.world }
+			for _, player in Players:GetPlayers() do
+				if player.Character then
+					table.insert(ignore, player.Character)
+				end
+			end
+			overlap.FilterDescendantsInstances = ignore
+			local queue = Surfaces.queue
+			for _, part in Workspace:GetPartBoundsInRadius(F.camPos, SCAN_RADIUS[tier], overlap) do
+				if not Surfaces.index[part] and not Surfaces.skip[part] then
+					Surfaces.skip[part] = true -- queued; adoption decides for good
+					table.insert(queue, part)
+				end
+			end
+		end
+
+		local amount = get("mat.reflectAmount")
+		local wetSheen = get("world.wetness") and get("mat.wetSheen") * sim.wet or 0
+
+		-- 2. Adopt a few queued parts.
+		local queue = Surfaces.queue
+		local adopted = 0
+		while adopted < ADOPT_PER_FRAME and #queue > 0 do
+			local part = table.remove(queue)
+			adopted += 1
+			local values = part.Parent and eligible(part)
+			if values then
+				local top = part.Position + Vector3.new(0, part.Size.Y * 0.5 + 0.2, 0)
+				local record = {
+					part = part,
+					original = part.Reflectance,
+					sheen = values[1],
+					porous = values[2],
+					exposed = Workspace:Raycast(top, Vector3.new(0, 120, 0), sim.rayParams) == nil,
+					applied = -1,
+				}
+				table.insert(Surfaces.list, record)
+				Surfaces.index[part] = record
+				Surfaces.skip[part] = nil
+				apply(record, amount, wetSheen)
+			end
+		end
+
+		-- 3. When the sheen or wetness moves, sweep the adopted parts.
+		local key = math.floor(amount * 50 + 0.5) * 1000 + math.floor(wetSheen * 50 + 0.5)
+		if key ~= Surfaces.appliedKey then
+			Surfaces.appliedKey = key
+			Surfaces.cursor = 1
+		end
+		local cursor = Surfaces.cursor
+		if cursor then
+			local list = Surfaces.list
+			local stop = math.min(cursor + REFRESH_PER_FRAME - 1, #list)
+			local index = cursor
+			while index <= stop do
+				local record = list[index]
+				if record.part.Parent then
+					apply(record, amount, wetSheen)
+					index += 1
+				else
+					-- Gone from the world: drop it (swap with the last entry).
+					Surfaces.index[record.part] = nil
+					list[index] = list[#list]
+					list[#list] = nil
+					stop = math.min(stop, #list)
+				end
+			end
+			Surfaces.cursor = index <= #list and index or nil
+		end
+	end
+end
+
+--------------------------------------------------------------------------------
+-- 13. UNDERWATER: FOG, LENS WARP, BUBBLES AND MUFFLED AUDIO
+--     The camera is under water when its terrain voxel holds water up to the
+--     camera's height (a single-voxel ReadVoxels, 12 times a second), or when
+--     it is inside a part tagged CONFIG.WaterTag. Below the surface the
+--     lighting stage filters all light through the water colour, the fog
+--     closes in, the post stage softens and tints the image, the camera stage
+--     sways and breathes like a lens behind moving water, and every sound in
+--     the world loses its high frequencies.
+--------------------------------------------------------------------------------
+
+local Underwater: { [string]: any } = { parts = {} }
+local Audio: { [string]: any } = { sounds = {}, groups = {}, effects = {}, applied = 0, reverbOwned = false }
+
+do
+	function Underwater.start()
+		table.clear(Underwater.parts)
+		local host = hiddenPart("Bubbles", Vector3.new(14, 6, 14), Fx.world)
+		Underwater.host = host
+		Underwater.bubbles = create("ParticleEmitter", {
+			Name = "Bubbles",
+			Enabled = false,
+			Rate = 14,
+			Texture = CONFIG.ParticleTexture,
+			EmissionDirection = Enum.NormalId.Top,
+			Lifetime = NumberRange.new(1.5, 3),
+			Speed = NumberRange.new(2, 5),
+			SpreadAngle = Vector2.new(12, 12),
+			Acceleration = Vector3.new(0, 3, 0),
+			Size = numberSequence({ { 0, 0.06 }, { 1, 0.16 } }),
+			Transparency = numberSequence({ { 0, 0.4 }, { 0.8, 0.5 }, { 1, 1 } }),
+			Color = ColorSequence.new(rgb(220, 240, 255)),
+			LightEmission = 0.4,
+			LightInfluence = 0.6,
+			Parent = host,
+		})
+	end
+
+	function Underwater.trackPart(instance)
+		if instance:IsA("BasePart") then
+			Underwater.parts[instance] = true
+		end
+	end
+
+	function Underwater.untrackPart(instance)
+		Underwater.parts[instance] = nil
+	end
+
+	local function inWaterPart(position)
+		for part in Underwater.parts do
+			if part.Parent then
+				local offset = part.CFrame:PointToObjectSpace(position)
+				local half = part.Size * 0.5
+				if math.abs(offset.X) <= half.X and math.abs(offset.Y) <= half.Y and math.abs(offset.Z) <= half.Z then
+					return part
+				end
+			end
+		end
+		return nil
+	end
+
+	local function inTerrainWater(position)
+		local terrain = Fx.terrain
+		if not terrain then
+			return false
+		end
+		local cell = Vector3.new(math.floor(position.X / 4) * 4, math.floor(position.Y / 4) * 4, math.floor(position.Z / 4) * 4)
+		local ok, materials, occupancies = pcall(terrain.ReadVoxels, terrain, Region3.new(cell, cell + Vector3.new(4, 4, 4)), 4)
+		if not ok or not materials[1] or not materials[1][1] then
+			return false
+		end
+		if materials[1][1][1] ~= Enum.Material.Water then
+			return false
+		end
+		-- A partly filled voxel holds water up to its occupancy.
+		return position.Y <= cell.Y + 4 * occupancies[1][1][1] + 0.1
+	end
+
+	function Stage.water(dt)
+		local enabled = get("mat.underwater")
+		if not enabled then
+			sim.submerged = false
+		elseif every("submerge", 1 / 12, dt) then
+			local position = F.camPos
+			local part = inWaterPart(position)
+			local submerged = part ~= nil or inTerrainWater(position)
+			if sim.submerged and not submerged then
+				sim.surfacedAt = sim.time
+			end
+			sim.submerged = submerged
+			if part then
+				sim.waterColor = part.Color
+			elseif submerged and Fx.terrain then
+				sim.waterColor = Fx.terrain.WaterColor
+			end
+		end
+		sim.underwater = approach(sim.underwater, sim.submerged and 1 or 0, sim.submerged and 9 or 5, dt)
+		if sim.underwater < 0.001 then
+			sim.underwater = 0
+		end
+
+		local bubbles = sim.underwater > 0.5 and get("mat.bubbles")
+		put(Underwater.bubbles, "Enabled", bubbles)
+		if bubbles then
+			Underwater.host.CFrame = CFrame.new(F.camPos + F.look * 6 - Vector3.new(0, 4, 0))
+		end
+
+		Audio.update(enabled and sim.underwater * get("mat.muffle") or 0)
+	end
+end
+
+do
+	-- Sounds that belong to a SoundGroup are muffled through the group, the
+	-- rest one by one. Effects are created the first time they are needed.
+	function Audio.track(instance)
+		if instance:IsA("Sound") then
+			Audio.sounds[instance] = true
+		elseif instance:IsA("SoundGroup") then
+			Audio.groups[instance] = true
+		end
+	end
+
+	function Audio.untrack(instance)
+		Audio.sounds[instance] = nil
+		Audio.groups[instance] = nil
+		Audio.effects[instance] = nil
+	end
+
+	local function muffle(target, amount)
+		local effect = Audio.effects[target]
+		if amount <= 0 then
+			if effect then
+				effect.Enabled = false
+			end
+			return
+		end
+		if not effect or not effect.Parent then
+			effect = Baseline.own(create("EqualizerSoundEffect", {
+				Name = "SolsticeMuffle",
+				Priority = 100,
+				Parent = target,
+			}))
+			Audio.effects[target] = effect
+		end
+		effect.Enabled = true
+		effect.HighGain = -42 * amount
+		effect.MidGain = -14 * amount
+		effect.LowGain = 2 * amount
+	end
+
+	function Audio.update(amount)
+		-- Only touch the sounds while the amount is actually moving.
+		if math.abs(amount - Audio.applied) < 0.02 and not (amount == 0 and Audio.applied ~= 0) then
+			return
+		end
+		Audio.applied = amount
+		for sound in Audio.sounds do
+			if sound.Parent and sound.SoundGroup == nil then
+				muffle(sound, amount)
+			end
+		end
+		for group in Audio.groups do
+			if group.Parent then
+				muffle(group, amount)
+			end
+		end
+		-- The built-in underwater reverb does the rest.
+		local wantReverb = amount > 0.25
+		if wantReverb ~= Audio.reverbOwned then
+			Audio.reverbOwned = wantReverb
+			if wantReverb then
+				writeProperty(SoundService, "AmbientReverb", Enum.ReverbType.UnderWater)
+			else
+				Baseline.restoreInstance(SoundService)
+			end
+		end
+	end
+
+	function Audio.stop()
+		table.clear(Audio.sounds)
+		table.clear(Audio.groups)
+		table.clear(Audio.effects)
+		Audio.applied = 0
+		Audio.reverbOwned = false
+	end
+end
+
+--------------------------------------------------------------------------------
+-- 14. POST-PROCESSING AND CAMERA
+--------------------------------------------------------------------------------
+
+do
+	local function makeEffect(className, name)
+		local ok, effect = pcall(Instance.new, className)
+		if not ok then
+			return nil
+		end
+		Baseline.own(effect)
+		effect.Name = "Solstice" .. name
+		effect.Enabled = false
+		effect.Parent = Lighting
+		return effect
+	end
+
+	function Stage.createEffects()
+		Fx.bloom = makeEffect("BloomEffect", "Bloom")
+		Fx.sunRays = makeEffect("SunRaysEffect", "LightShafts")
+		Fx.color = makeEffect("ColorCorrectionEffect", "Grade")
+		Fx.dof = makeEffect("DepthOfFieldEffect", "DepthOfField")
+		Fx.blur = makeEffect("BlurEffect", "MotionBlur")
+		-- The tone mapper is a newer class; on engines without it this is nil
+		-- and the "Tone mapping" choice simply has no effect.
+		Fx.grading = makeEffect("ColorGradingEffect", "ToneMap")
+		if Fx.grading then
+			pcall(function()
+				Fx.grading.TonemapperPreset = (Enum :: any).TonemapperPreset.Retro
+			end)
+		end
+	end
+
+	-- Warm (+) or cool (-) white balance as a multiplicative tint.
+	local function temperatureTint(amount)
+		if amount >= 0 then
+			return Color3.new(1, 1 - 0.06 * amount, 1 - 0.16 * amount)
+		end
+		return Color3.new(1 + 0.14 * amount, 1 + 0.05 * amount, 1)
+	end
+
+	-- Green (-) or magenta (+), Lightroom's "Tint".
+	local function tintShift(amount)
+		if amount >= 0 then
+			return Color3.new(1, 1 - 0.12 * amount, 1)
+		end
+		return Color3.new(1 + 0.1 * amount, 1, 1 + 0.1 * amount)
+	end
+
+	----------------------------------------------------------------------------
+	-- Focus. Real lenses are focused in dioptres (1 / distance): racking from
+	-- 2 to 4 studs moves the focus ring as far as from 4 studs to infinity.
+	-- So focus is eased in dioptres by a slightly under-damped spring, which
+	-- gives the quick start, soft landing and tiny settle of a real autofocus
+	-- motor rather than a snap. Adaptive mode behaves like continuous AF:
+	-- it samples what is under the centre (or your character), ignores
+	-- changes smaller than the threshold, waits for a new subject to hold for
+	-- the refocus delay, and only then pulls. Static mode holds a distance.
+	----------------------------------------------------------------------------
+
+	local Focus = {}
+	local hasSpherecast = pcall(function()
+		return (Workspace :: any).Spherecast
+	end)
+
+	function Focus.measure()
+		if get("cam.focusTarget") == 2 then
+			local character = localPlayer.Character
+			local subject = character and (character:FindFirstChild("Head") or character:FindFirstChild("HumanoidRootPart"))
+			if subject then
+				local distance = (subject.Position - F.camPos).Magnitude
+				-- In first person the head is at the camera: fall back to centre.
+				if distance > 1.5 then
+					return distance
+				end
+			end
+		end
+		local hit
+		if hasSpherecast then
+			-- A fat ray: thin grass blades and twigs do not steal focus.
+			hit = (Workspace :: any):Spherecast(F.camPos, 0.6, F.look * 400, sim.rayParams)
+		else
+			hit = Workspace:Raycast(F.camPos, F.look * 400, sim.rayParams)
+		end
+		return hit and hit.Distance or 400
+	end
+
+	function Focus.update(dt, cine)
+		local spring = sim.focusSpring
+		if get("cam.focusMode") == 1 then
+			spring.target = 1 / get("cam.focusDistance")
+		else
+			if every("focus", cine and 1 / 30 or 0.08, dt) then
+				local measured = Focus.measure()
+				local committed = sim.afCommitted
+				local threshold = get("cam.focusThreshold")
+				if math.abs(measured - committed) / math.max(committed, 1) > threshold then
+					local candidate = sim.afCandidate
+					if math.abs(measured - candidate) / math.max(candidate, 1) > threshold * 0.5 + 0.02 then
+						-- Something new under the focus point: start its clock.
+						sim.afCandidate = measured
+						sim.afCandidateSince = sim.time
+					elseif sim.time - sim.afCandidateSince >= get("cam.focusDelay") then
+						sim.afCommitted = measured
+					end
+				else
+					sim.afCandidate = committed
+					sim.afCandidateSince = sim.time
+				end
+			end
+			spring.target = 1 / math.max(sim.afCommitted, 0.5)
+		end
+		-- A spring at this frequency and damping settles in about the pull time.
+		spring.frequency = 0.75 / get("cam.focusSpeed")
+		spring:advance(dt)
+		sim.focus = 1 / math.max(spring.value, 1 / 1000)
+		return sim.focus
+	end
+
+	function Stage.post(dt)
+		local filter = F.filter
+		local strength = F.filterStrength
+		local tiltShift = get("fun.tiltShift")
+		local underwater = sim.underwater
+		local clarity = get("cam.clarity")
+		local whites = get("cam.whites")
+		local blacks = get("cam.blacks")
+		local dehaze = get("cam.dehaze")
+
+		-- Bloom. The threshold is how bright a pixel must be to glow; Whites
+		-- push it down a little, negative Clarity adds a soft, dreamy glow.
+		local bloomTier = Settings.tier("cam.bloom")
+		if bloomTier > 1 then
+			local intensity = Look.bloomIntensity[bloomTier] * (0.35 + 1.3 * get("cam.bloomStrength"))
+			intensity += (filter.bloom or 0) * strength + sim.flash * 0.5 + underwater * 0.25 - clarity * 0.15
+			put(Fx.bloom, "Enabled", true)
+			put(Fx.bloom, "Size", Look.bloomSize[bloomTier], 0.5)
+			put(Fx.bloom, "Intensity", math.max(intensity, 0), 0.01)
+			put(Fx.bloom, "Threshold", get("cam.bloomThreshold") - 0.2 * F.night - 0.3 * whites, 0.01)
+		else
+			put(Fx.bloom, "Enabled", false)
+		end
+
+		-- Light shafts are strongest at golden hour and vanish under cloud;
+		-- under water they become the shafts slanting down from the surface.
+		local shafts = get("atmo.shafts") * (0.3 * F.day + 0.5 * F.twilight) * (1 - sim.overcast * 0.9)
+		shafts = lerp(shafts, 0.12 * F.day, underwater)
+		put(Fx.sunRays, "Enabled", shafts > 0.004)
+		put(Fx.sunRays, "Intensity", shafts, 0.004)
+		put(Fx.sunRays, "Spread", 0.55 + 0.35 * F.twilight, 0.01)
+
+		-- Depth of field. The engine clamps focus to 200 studs and the sharp
+		-- band to 50, so far blur is faded out when focusing on the distance.
+		local dofTier = Settings.tier("cam.dof")
+		local dof = Fx.dof
+		if tiltShift then
+			local subject = 40
+			local character = localPlayer.Character
+			local root = character and character:FindFirstChild("HumanoidRootPart")
+			if root then
+				subject = (root.Position - F.camPos).Magnitude
+			end
+			sim.focus = approach(sim.focus, subject, 8, dt)
+			put(dof, "Enabled", true)
+			put(dof, "FocusDistance", math.min(sim.focus, 200), 0.1)
+			put(dof, "InFocusRadius", 5, 0.1)
+			put(dof, "FarIntensity", 0.75, 0.01)
+			put(dof, "NearIntensity", 0.6, 0.01)
+		elseif dofTier > 1 or underwater > 0.01 then
+			local amount = get("cam.dofStrength")
+			local focus, radius, far, near = 60, 50, 0, 0
+			if dofTier == 2 then
+				radius, far = 50, 0.12 + 0.55 * amount
+			elseif dofTier >= 3 then
+				local distance = Focus.update(dt, dofTier == 4)
+				focus = math.min(distance, 200)
+				local farFade = 1 - smoothstep(110, 200, distance)
+				if dofTier == 3 then
+					radius, far, near = math.clamp(focus * 0.6, 8, 50), (0.18 + 0.6 * amount) * farFade, 0.25 * amount
+				else
+					radius, far, near = math.clamp(focus * 0.35, 4, 40), (0.3 + 0.7 * amount) * farFade, 0.5 * amount
+				end
+			end
+			-- Under water everything past arm's length goes soft.
+			if underwater > 0.01 then
+				focus = lerp(focus, 12, underwater)
+				radius = lerp(radius, 6, underwater)
+				far = lerp(far, 0.55, underwater)
+			end
+			put(dof, "Enabled", true)
+			put(dof, "FocusDistance", focus, 0.1)
+			put(dof, "InFocusRadius", radius, 0.1)
+			put(dof, "FarIntensity", far, 0.01)
+			put(dof, "NearIntensity", near, 0.01)
+		else
+			put(dof, "Enabled", false)
+		end
+
+		-- Motion blur: Roblox has no velocity buffer, so this blurs the whole
+		-- frame in proportion to how fast the camera turns past the threshold.
+		local motionBlur = get("cam.motionBlur")
+		local blurTarget = 0
+		if motionBlur > 0 and sim.lastLook then
+			local turned = math.acos(math.clamp(F.look:Dot(sim.lastLook), -1, 1))
+			local speed = turned / math.max(F.rawDt, 1 / 240)
+			local threshold = math.rad(get("cam.motionThreshold"))
+			blurTarget = math.clamp((speed - threshold) * 7 * motionBlur, 0, 24)
+		end
+		-- Water in front of the lens softens the whole image a touch.
+		blurTarget += underwater * get("mat.underwaterWarp") * 3
+		sim.lastLook = F.look
+		sim.blur = approach(sim.blur, blurTarget, blurTarget > sim.blur and 18 or 9, dt)
+		put(Fx.blur, "Enabled", sim.blur > 0.35)
+		put(Fx.blur, "Size", sim.blur, 0.15)
+
+		-- The grade: style, season, weather, the Lightroom-style controls,
+		-- then the fun filter on top.
+		local saturation = get("cam.saturation") + (F.reimagined and 0.06 or 0)
+		saturation += F.season.saturation - 0.06 * F.night - 0.12 * sim.overcast + clarity * 0.04
+		-- Vibrance: a global control cannot single out muted pixels, so it
+		-- does the next best thing and backs off as the image gets saturated.
+		local vibrance = get("cam.vibrance")
+		if vibrance > 0 then
+			saturation += vibrance * 0.35 * (1 - clamp01(saturation))
+		else
+			saturation += vibrance * 0.35
+		end
+		local contrast = get("cam.contrast") + (F.reimagined and -0.06 or 0) + sim.wet * 0.03
+		contrast += clarity * 0.12 + dehaze * 0.06 + whites * 0.05 - blacks * 0.1
+		local brightness = sim.flash * 0.06 + whites * 0.03 + blacks * 0.05
+		local tint = multiplyColor(temperatureTint(get("cam.temperature") + F.twilight * 0.12), F.season.tint)
+		tint = multiplyColor(tint, tintShift(get("cam.tint")))
+		local midAmount = get("cam.midAmount")
+		if midAmount > 0 then
+			tint = multiplyColor(tint, hueTint(get("cam.midHue"), midAmount * 0.35))
+		end
+		if underwater > 0.001 then
+			local water = sim.waterColor
+			local level = math.max(water.R, water.G, water.B, 0.05)
+			local waterTint = Color3.new(water.R / level, water.G / level, water.B / level)
+			tint = tint:Lerp(multiplyColor(tint, waterTint), underwater * 0.6)
+			saturation -= 0.2 * underwater
+			contrast += 0.06 * underwater
+		end
+
+		if strength > 0 then
+			saturation = lerp(saturation, filter.saturation, strength)
+			contrast += filter.contrast * strength
+			brightness += filter.brightness * strength
+			tint = tint:Lerp(multiplyColor(tint, filter.tint), strength)
+		end
+		if get("fun.hueCycle") then
+			sim.hue = (sim.hue + dt * get("fun.hueSpeed") * 0.5) % 1
+			tint = multiplyColor(tint, Color3.fromHSV(sim.hue, 0.45, 1))
+		end
+		if tiltShift then
+			-- Toy-like colour sells the miniature illusion.
+			saturation += 0.15
+			contrast += 0.05
+		end
+
+		put(Fx.color, "Enabled", true)
+		put(Fx.color, "Saturation", math.clamp(saturation, -1, 1), 0.003)
+		put(Fx.color, "Contrast", math.clamp(contrast, -1, 1), 0.003)
+		put(Fx.color, "Brightness", math.clamp(brightness, -1, 1), 0.003)
+		put(Fx.color, "TintColor", tint)
+
+		if Fx.grading then
+			put(Fx.grading, "Enabled", get("cam.tonemap") == 2)
+		end
+	end
+
+	function Stage.camera(dt)
+		local camera = F.camera
+		local time = sim.time
+
+		-- Speed kick: the field of view widens once the character passes the
+		-- threshold speed, reaching the full kick "range" studs/s later.
+		local kickLimit = get("cam.speedFov")
+		local kickTarget = 0
+		if kickLimit > 0 then
+			local character = localPlayer.Character
+			local root = character and character:FindFirstChild("HumanoidRootPart")
+			if root then
+				local speed = root.AssemblyLinearVelocity.Magnitude
+				kickTarget = clamp01((speed - get("cam.speedThreshold")) / get("cam.speedRange")) * kickLimit
+			end
+		end
+		sim.fovKick = approach(sim.fovKick, kickTarget, 4, dt)
+
+		local wobble = get("fun.wobble")
+		local warp = sim.underwater * get("mat.underwaterWarp")
+		local offset = sim.fovKick
+		if wobble > 0 then
+			offset += math.noise(time * 0.35, 3.1) * 8 * wobble
+		end
+		if warp > 0.001 then
+			-- The lens "breathes" as if seen through moving water.
+			offset += math.sin(time * 1.7) * 2.2 * warp
+		end
+		if get("cam.focusBreathing") and Settings.tier("cam.dof") >= 3 and sim.focusSpring then
+			-- Close focus narrows the view slightly, like most real lenses.
+			offset -= math.min(sim.focusSpring.value * 25, 1.5)
+		end
+
+		-- The field of view is shared with the game. If the value is not the
+		-- one we last wrote, something else changed it, and that becomes the
+		-- new base our offset is added to.
+		if math.abs(camera.FieldOfView - sim.lastFov) > 0.02 then
+			sim.baseFov = camera.FieldOfView
+		end
+		local active = math.abs(offset) > 0.01
+		if active or sim.fovOwned then
+			camera.FieldOfView = math.clamp(sim.baseFov + offset, 1, 120)
+			sim.lastFov = camera.FieldOfView
+			sim.fovOwned = active
+		end
+
+		-- Wobble and underwater sway tilt the finished camera frame. The
+		-- default camera rebuilds its CFrame every frame; for cameras that do
+		-- not, the untouched frame is remembered so the tilt never accumulates.
+		local pitch, yaw, roll = 0, 0, 0
+		if wobble > 0 then
+			roll += math.noise(time * 0.31, 11.7) * 0.16 * wobble
+			pitch += math.noise(time * 0.27, 23.4) * 0.06 * wobble
+			yaw += math.noise(time * 0.23, 37.9) * 0.06 * wobble
+		end
+		if warp > 0.001 then
+			roll += math.sin(time * 0.9) * 0.022 * warp
+			pitch += math.noise(time * 1.3, 41.2) * 0.012 * warp
+			yaw += math.noise(time * 1.1, 17.9) * 0.012 * warp
+		end
+		if (wobble > 0 or warp > 0.001) and camera.CameraType == Enum.CameraType.Custom then
+			local base = camera.CFrame
+			if sim.tiltWritten and base == sim.tiltWritten then
+				base = sim.tiltBase
+			end
+			local tilted = base * CFrame.Angles(pitch, yaw, roll)
+			camera.CFrame = tilted
+			sim.tiltBase = base
+			sim.tiltWritten = tilted
+		elseif sim.tiltWritten then
+			if camera.CFrame == sim.tiltWritten then
+				camera.CFrame = sim.tiltBase
+			end
+			sim.tiltBase = nil
+			sim.tiltWritten = nil
+		end
+	end
+
+	function Stage.releaseCamera()
+		local camera = Workspace.CurrentCamera
+		if camera then
+			if sim.fovOwned then
+				camera.FieldOfView = sim.baseFov
+			end
+			if sim.tiltWritten and camera.CFrame == sim.tiltWritten then
+				camera.CFrame = sim.tiltBase
+			end
+		end
+		sim.fovOwned = false
+		sim.lastFov = -1
+		sim.tiltBase = nil
+		sim.tiltWritten = nil
+	end
+end
+
+--------------------------------------------------------------------------------
+-- 15. SCREEN OVERLAY: VIGNETTE, GRAIN, FLARE, DROPLETS, BARS, CROSSHAIR
+--     Drawn in a ScreenGui that sits underneath every other interface.
+--
+--     Vignette and grain want generated textures, which is what EditableImage
+--     is for. That API has to be allowed in the experience's settings once it
+--     is published, so the overlay probes for it: with it, the vignette is a
+--     true radial falloff and grain is available; without it, the vignette is
+--     built from four edge gradients and the grain row is locked.
+--------------------------------------------------------------------------------
+
+local Overlay: { [string]: any } = { ghosts = {}, edges = {}, textures = {}, drops = {}, crosshair = {} }
+
+do
+	local GRAIN_SIZE = 128
+	local VIGNETTE_SIZE = 128
+	local DROP_POOL = 16
+	local LETTERBOX_RATIOS = { 2.39, 2, 1.85 }
+	local CROSSHAIR_COLORS = {
+		rgb(255, 255, 255),
+		rgb(90, 255, 120),
+		rgb(255, 70, 70),
+		rgb(80, 230, 255),
+		rgb(255, 230, 80),
+	}
+
+	-- Ghost reflections strung along the line from the sun through the
+	-- centre of the screen. k is the position along that line (1 = centre).
+	local GHOSTS = {
+		{ k = 0.42, size = 46, alpha = 0.1, color = rgb(255, 196, 140) },
+		{ k = 0.68, size = 92, alpha = 0.07, color = rgb(140, 200, 255), ring = true },
+		{ k = 1, size = 26, alpha = 0.12, color = rgb(255, 240, 200) },
+		{ k = 1.32, size = 120, alpha = 0.05, color = rgb(170, 140, 255) },
+		{ k = 1.7, size = 64, alpha = 0.09, color = rgb(130, 255, 200), ring = true },
+		{ k = 2.1, size = 150, alpha = 0.04, color = rgb(255, 170, 120) },
+	}
+
+	-- Called once at boot so the interface knows whether to lock "Film grain".
+	function Overlay.probe()
+		local test = paintTexture(2, function()
+			return 0, 0, 0, 0
+		end)
+		Caps.editableImage = test ~= nil
+		if test then
+			test:Destroy()
+		end
+	end
+
+	local function edgeGradient(parent, anchor, position, size, rotation, fromAlpha, toAlpha)
+		local frame = create("Frame", {
+			AnchorPoint = anchor,
+			Position = position,
+			Size = size,
+			BackgroundColor3 = rgb(0, 0, 0),
+			BackgroundTransparency = 1,
+			BorderSizePixel = 0,
+			Parent = parent,
+		})
+		create("UIGradient", {
+			Rotation = rotation,
+			Transparency = NumberSequence.new(fromAlpha, toAlpha),
+			Parent = frame,
+		})
+		return frame
+	end
+
+	local function crosshairPart(parent, size, position, round)
+		local frame = create("Frame", {
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = position,
+			Size = size,
+			BackgroundColor3 = rgb(255, 255, 255),
+			BorderSizePixel = 0,
+			Parent = parent,
+		})
+		if round then
+			create("UICorner", { CornerRadius = UDim.new(0.5, 0), Parent = frame })
+		end
+		return frame
+	end
+
+	function Overlay.start()
+		local screen = Baseline.own(create("ScreenGui", {
+			Name = "SolsticeOverlay",
+			ResetOnSpawn = false,
+			IgnoreGuiInset = true,
+			DisplayOrder = -100,
+		}))
+		Overlay.screen = screen
+		Overlay.vignetteImage = nil
+		Overlay.grainImage = nil
+		Overlay.crosshairKey = nil
+		Overlay.barsApplied = -1
+		table.clear(Overlay.edges)
+		table.clear(Overlay.ghosts)
+		table.clear(Overlay.drops)
+		table.clear(Overlay.crosshair)
+
+		-- Lens flare ghosts (drawn first so the vignette darkens them too).
+		for index, spec in GHOSTS do
+			local ghost = create("Frame", {
+				Name = "Ghost" .. index,
+				AnchorPoint = Vector2.new(0.5, 0.5),
+				BackgroundColor3 = spec.color,
+				BackgroundTransparency = 1,
+				BorderSizePixel = 0,
+				Visible = false,
+				Parent = screen,
+			}, { create("UICorner", { CornerRadius = UDim.new(0.5, 0) }) })
+			local stroke = nil
+			if spec.ring then
+				stroke = create("UIStroke", { Color = spec.color, Thickness = 2, Transparency = 1, Parent = ghost })
+			end
+			Overlay.ghosts[index] = { frame = ghost, stroke = stroke, spec = spec }
+		end
+
+		-- Lens droplets: faint discs with a bright rim, like water beading on
+		-- glass. They slide down and evaporate.
+		for index = 1, DROP_POOL do
+			local frame = create("Frame", {
+				Name = "Drop" .. index,
+				AnchorPoint = Vector2.new(0.5, 0.5),
+				BackgroundColor3 = rgb(205, 218, 235),
+				BackgroundTransparency = 1,
+				BorderSizePixel = 0,
+				Visible = false,
+				Parent = screen,
+			}, { create("UICorner", { CornerRadius = UDim.new(0.5, 0) }) })
+			local stroke = create("UIStroke", { Color = rgb(255, 255, 255), Thickness = 1, Transparency = 1, Parent = frame })
+			Overlay.drops[index] = { frame = frame, stroke = stroke, alive = false }
+		end
+
+		-- Vignette: radial texture if the image API is available...
+		local vignette = Caps.editableImage
+				and paintTexture(VIGNETTE_SIZE, function(x, y)
+					local nx = (x + 0.5) / VIGNETTE_SIZE * 2 - 1
+					local ny = (y + 0.5) / VIGNETTE_SIZE * 2 - 1
+					local distance = math.sqrt(nx * nx + ny * ny) / 1.4142
+					local alpha = smoothstep(0.38, 1, distance) ^ 1.4
+					return 0, 0, 0, math.floor(alpha * 255)
+				end)
+			or nil
+		if vignette then
+			table.insert(Overlay.textures, vignette)
+			Overlay.vignetteImage = create("ImageLabel", {
+				Name = "Vignette",
+				Size = UDim2.fromScale(1, 1),
+				BackgroundTransparency = 1,
+				ImageTransparency = 1,
+				ImageContent = Content.fromObject(vignette),
+				Parent = screen,
+			})
+		else
+			-- ...otherwise four gradients, one per screen edge. Their overlap
+			-- in the corners is what makes the corners darkest.
+			local zero, half = Vector2.zero, UDim2.fromScale
+			Overlay.edges = {
+				edgeGradient(screen, zero, half(0, 0), half(1, 0.34), 90, 0, 1),
+				edgeGradient(screen, Vector2.new(0, 1), half(0, 1), half(1, 0.34), 90, 1, 0),
+				edgeGradient(screen, zero, half(0, 0), half(0.26, 1), 0, 0, 1),
+				edgeGradient(screen, Vector2.new(1, 0), half(1, 0), half(0.26, 1), 0, 1, 0),
+			}
+		end
+
+		-- Film grain: a tile of random black and white specks that is nudged
+		-- to a new offset thirty times a second.
+		if Caps.editableImage then
+			local noise = Random.new(7)
+			local grain = paintTexture(GRAIN_SIZE, function()
+				local value = noise:NextNumber() < 0.5 and 0 or 255
+				return value, value, value, noise:NextInteger(0, 255)
+			end)
+			if grain then
+				table.insert(Overlay.textures, grain)
+				Overlay.grainImage = create("ImageLabel", {
+					Name = "Grain",
+					Position = UDim2.fromOffset(-GRAIN_SIZE, -GRAIN_SIZE),
+					Size = UDim2.new(1, GRAIN_SIZE * 2, 1, GRAIN_SIZE * 2),
+					BackgroundTransparency = 1,
+					ImageTransparency = 1,
+					ScaleType = Enum.ScaleType.Tile,
+					TileSize = UDim2.fromOffset(GRAIN_SIZE, GRAIN_SIZE),
+					ImageContent = Content.fromObject(grain),
+					Visible = false,
+					Parent = screen,
+				})
+			end
+		end
+
+		-- Crosshair (a ReShade favourite): every style is built once and
+		-- shown or hidden as a group.
+		local holder = create("Frame", {
+			Name = "Crosshair",
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.fromScale(0.5, 0.5),
+			Size = UDim2.fromOffset(40, 40),
+			BackgroundTransparency = 1,
+			ZIndex = 4,
+			Visible = false,
+			Parent = screen,
+		})
+		Overlay.crosshairHolder = holder
+		Overlay.crosshairScale = create("UIScale", { Parent = holder })
+		local centre = UDim2.fromScale(0.5, 0.5)
+		Overlay.crosshair = {
+			{ crosshairPart(holder, UDim2.fromOffset(4, 4), centre, true) },
+			{
+				crosshairPart(holder, UDim2.fromOffset(2, 9), UDim2.new(0.5, 0, 0.5, -9)),
+				crosshairPart(holder, UDim2.fromOffset(2, 9), UDim2.new(0.5, 0, 0.5, 9)),
+				crosshairPart(holder, UDim2.fromOffset(9, 2), UDim2.new(0.5, -9, 0.5, 0)),
+				crosshairPart(holder, UDim2.fromOffset(9, 2), UDim2.new(0.5, 9, 0.5, 0)),
+			},
+			{ crosshairPart(holder, UDim2.fromOffset(18, 18), centre, true), crosshairPart(holder, UDim2.fromOffset(2, 2), centre, true) },
+		}
+		-- The circle style is a ring: its disc is see-through with a stroke.
+		local ring = Overlay.crosshair[3][1]
+		ring.BackgroundTransparency = 1
+		Overlay.crosshairRing = create("UIStroke", { Thickness = 1.5, Color = rgb(255, 255, 255), Parent = ring })
+
+		-- Cinematic bars sit on top of everything else in the overlay.
+		Overlay.topBar = create("Frame", {
+			Name = "BarTop",
+			Size = UDim2.fromScale(1, 0),
+			BackgroundColor3 = rgb(0, 0, 0),
+			BorderSizePixel = 0,
+			ZIndex = 5,
+			Parent = screen,
+		})
+		Overlay.bottomBar = create("Frame", {
+			Name = "BarBottom",
+			AnchorPoint = Vector2.new(0, 1),
+			Position = UDim2.fromScale(0, 1),
+			Size = UDim2.fromScale(1, 0),
+			BackgroundColor3 = rgb(0, 0, 0),
+			BorderSizePixel = 0,
+			ZIndex = 5,
+			Parent = screen,
+		})
+
+		screen.Parent = playerGui
+	end
+
+	-- The ScreenGui is destroyed with everything else the engine owns, but
+	-- EditableImages are plain objects holding texture memory, not instances
+	-- in the tree, so they are released explicitly.
+	function Overlay.stop()
+		for _, texture in Overlay.textures do
+			texture:Destroy()
+		end
+		table.clear(Overlay.textures)
+		Overlay.vignetteImage = nil
+		Overlay.grainImage = nil
+	end
+
+	local function spawnDrop(viewport, burst)
+		for _, drop in Overlay.drops do
+			if not drop.alive then
+				drop.alive = true
+				drop.age = 0
+				drop.life = between(2, 5.5)
+				drop.x = between(0.04, 0.96) * viewport.X
+				drop.y = between(0.02, burst and 0.95 or 0.7) * viewport.Y
+				drop.size = between(5, burst and 26 or 18) * viewport.Y / 1080
+				drop.fall = between(3, 14) * viewport.Y / 1080
+				drop.frame.Visible = true
+				return
+			end
+		end
+	end
+
+	local function updateDrops(dt, viewport)
+		local enabled = get("cam.lensDrops")
+		local surfaced = sim.time - sim.surfacedAt
+		if enabled then
+			-- Climbing out of water leaves the lens covered.
+			if surfaced < 0.15 and not Overlay.burstDone then
+				Overlay.burstDone = true
+				for _ = 1, DROP_POOL do
+					spawnDrop(viewport, true)
+				end
+			elseif surfaced >= 0.15 then
+				Overlay.burstDone = false
+			end
+			-- Rain lands on the lens when it faces the sky.
+			local facing = clamp01(F.look.Y + 0.6)
+			local rate = 2.5 * sim.rain * (1 - sim.shelter) * (1 - sim.underwater) * facing
+			if rate > 0 and random:NextNumber() < rate * dt then
+				spawnDrop(viewport, false)
+			end
+		end
+		for _, drop in Overlay.drops do
+			if drop.alive then
+				drop.age += dt
+				if drop.age >= drop.life or not enabled or sim.underwater > 0.5 then
+					drop.alive = false
+					drop.frame.Visible = false
+				else
+					-- Drops cling, then run; they shrink as they evaporate.
+					local progress = drop.age / drop.life
+					drop.y += drop.fall * dt * (0.3 + progress * 1.6)
+					local size = drop.size * (1 - progress * 0.4)
+					local fade = 1 - smoothstep(0.6, 1, progress)
+					drop.frame.Position = UDim2.fromOffset(drop.x, drop.y)
+					drop.frame.Size = UDim2.fromOffset(size, size * 1.08)
+					drop.frame.BackgroundTransparency = 1 - 0.18 * fade
+					drop.stroke.Transparency = 1 - 0.55 * fade
+				end
+			end
+		end
+	end
+
+	function Overlay.update(dt)
+		local camera = F.camera
+		local viewport = camera.ViewportSize
+
+		-- Vignette
+		local vignette = get("cam.vignette")
+		if Overlay.vignetteImage then
+			put(Overlay.vignetteImage, "ImageTransparency", 1 - vignette * 0.95, 0.004)
+		else
+			for _, edge in Overlay.edges do
+				put(edge, "BackgroundTransparency", 1 - vignette * 0.75, 0.004)
+			end
+		end
+
+		-- Grain
+		local grainImage = Overlay.grainImage
+		if grainImage then
+			local grain = get("cam.grain")
+			put(grainImage, "Visible", grain > 0)
+			if grain > 0 then
+				put(grainImage, "ImageTransparency", 1 - grain * 0.14, 0.002)
+				if every("grain", 1 / 30, dt) then
+					grainImage.Position = UDim2.fromOffset(-math.random(0, GRAIN_SIZE), -math.random(0, GRAIN_SIZE))
+				end
+			end
+		end
+
+		-- Lens flare: needs the sun in front of the camera, on screen, and
+		-- not hidden behind geometry (one ray, ten times a second).
+		local visibility = 0
+		local sunX, sunY = 0, 0
+		if get("cam.flare") and F.day > 0.02 and sim.overcast < 0.9 and sim.underwater < 0.5 then
+			local point = camera:WorldToViewportPoint(F.camPos + F.sun * 5000)
+			if point.Z > 0 then
+				sunX, sunY = point.X, point.Y
+				local offCentre = math.max(math.abs(sunX / viewport.X - 0.5), math.abs(sunY / viewport.Y - 0.5))
+				local edgeFade = 1 - smoothstep(0.42, 0.62, offCentre)
+				if edgeFade > 0 then
+					if every("flare", 0.1, dt) then
+						sim.flareOpen = Workspace:Raycast(F.camPos, F.sun * 1500, sim.rayParams) == nil
+					end
+					visibility = (sim.flareOpen and 1 or 0) * edgeFade * F.day * (1 - sim.overcast)
+				end
+			end
+		end
+		sim.flare = approach(sim.flare, visibility, 10, dt)
+
+		local showFlare = sim.flare > 0.01
+		local flareGain = 0.4 + 1.2 * get("cam.flareStrength")
+		local scale = viewport.Y / 1080
+		for _, ghost in Overlay.ghosts do
+			local frame = ghost.frame
+			put(frame, "Visible", showFlare)
+			if showFlare then
+				local spec = ghost.spec
+				local x = sunX + (viewport.X * 0.5 - sunX) * spec.k
+				local y = sunY + (viewport.Y * 0.5 - sunY) * spec.k
+				local size = spec.size * scale
+				frame.Position = UDim2.fromOffset(x, y)
+				frame.Size = UDim2.fromOffset(size, size)
+				local transparency = 1 - math.min(spec.alpha * sim.flare * flareGain, 0.6)
+				if ghost.stroke then
+					ghost.stroke.Transparency = transparency
+				else
+					frame.BackgroundTransparency = transparency
+				end
+			end
+		end
+
+		updateDrops(dt, viewport)
+
+		-- Crosshair: rebuilt only when its style, size or colour changes.
+		local style = get("fun.crosshair")
+		local key = style * 1000 + get("fun.crosshairColor") * 100 + math.floor(get("fun.crosshairSize") * 20 + 0.5)
+		if key ~= Overlay.crosshairKey then
+			Overlay.crosshairKey = key
+			local color = CROSSHAIR_COLORS[get("fun.crosshairColor")]
+			Overlay.crosshairHolder.Visible = style > 1
+			Overlay.crosshairScale.Scale = get("fun.crosshairSize")
+			Overlay.crosshairRing.Color = color
+			for index, group in Overlay.crosshair do
+				for _, frame in group do
+					frame.Visible = index == style - 1
+					frame.BackgroundColor3 = color
+				end
+			end
+		end
+
+		-- Cinematic bars ease in and out, sized for the chosen aspect ratio.
+		local barTarget = 0
+		if get("fun.letterbox") and viewport.Y > 0 then
+			local ratio = LETTERBOX_RATIOS[get("fun.letterboxRatio")]
+			barTarget = math.max(0, (1 - viewport.X / ratio / viewport.Y) / 2)
+		end
+		sim.bars = approach(sim.bars, barTarget, 6, dt)
+		local bars = sim.bars < 0.0005 and 0 or sim.bars
+		if math.abs(bars - Overlay.barsApplied) > 0.0002 then
+			Overlay.barsApplied = bars
+			local barSize = UDim2.fromScale(1, bars)
+			Overlay.topBar.Size = barSize
+			Overlay.bottomBar.Size = barSize
+		end
+	end
+end
+
+--------------------------------------------------------------------------------
+-- 16. ADAPTIVE QUALITY AND ENGINE LIFECYCLE
+--------------------------------------------------------------------------------
+
+-- The governor. It samples a smoothed frame rate every two seconds. Below the
+-- target it lowers every tier by one more step; after ten comfortable seconds
+-- it gives one step back. The asymmetry stops it oscillating around a setting
+-- the machine cannot quite hold.
+local Adaptive = { fps = 60, timer = 0, comfortable = 0, warmup = 5 }
+
+function Adaptive.update(rawDt)
+	Adaptive.fps = approach(Adaptive.fps, 1 / math.max(rawDt, 1 / 1000), 1.5, math.min(rawDt, 0.25))
+	if not Settings.adaptive then
+		Settings.setGovernor(0)
+		return
+	end
+	if Adaptive.warmup > 0 then
+		-- Ignore the first seconds, when assets are still streaming in.
+		Adaptive.warmup -= rawDt
+		return
+	end
+	Adaptive.timer += rawDt
+	if Adaptive.timer < 2 then
+		return
+	end
+	Adaptive.timer = 0
+
+	local target = CONFIG.AdaptiveTargetFps
+	if Adaptive.fps < target - 5 then
+		Adaptive.comfortable = 0
+		Settings.setGovernor(math.min(3, Settings.governor + 1))
+	elseif Adaptive.fps > target + 8 then
+		Adaptive.comfortable += 2
+		if Adaptive.comfortable >= 10 and Settings.governor > 0 then
+			Adaptive.comfortable = 0
+			Settings.setGovernor(Settings.governor - 1)
+		end
+	else
+		Adaptive.comfortable = 0
+	end
+end
+
+-- One pair of DescendantAdded / DescendantRemoving connections per root feeds
+-- every module that keeps a list of place instances (lights, sounds), rather
+-- than each module listening to the whole Workspace on its own.
+local Registry = { connections = {}, generation = 0 }
+
+function Registry.classify(instance)
+	if instance:IsA("Light") then
+		Lights.track(instance)
+	elseif instance:IsA("Sound") or instance:IsA("SoundGroup") then
+		Audio.track(instance)
+	end
+end
+
+function Registry.unclassify(instance)
+	Lights.untrack(instance)
+	Audio.untrack(instance)
+end
+
+function Registry.start()
+	Registry.generation += 1
+	local generation = Registry.generation
+	local roots = { Workspace, SoundService }
+	for _, root in roots do
+		table.insert(Registry.connections, root.DescendantAdded:Connect(Registry.classify))
+		table.insert(Registry.connections, root.DescendantRemoving:Connect(Registry.unclassify))
+	end
+	-- Tagged water volumes for the underwater effect.
+	local tag = CONFIG.WaterTag
+	for _, part in CollectionService:GetTagged(tag) do
+		Underwater.trackPart(part)
+	end
+	table.insert(Registry.connections, CollectionService:GetInstanceAddedSignal(tag):Connect(Underwater.trackPart))
+	table.insert(Registry.connections, CollectionService:GetInstanceRemovedSignal(tag):Connect(Underwater.untrackPart))
+	-- The initial sweep can cover a very large place, so it yields every
+	-- few thousand instances instead of stalling one frame.
+	task.spawn(function()
+		for _, root in roots do
+			for index, descendant in root:GetDescendants() do
+				if generation ~= Registry.generation then
+					return
+				end
+				Registry.classify(descendant)
+				if index % 4000 == 0 then
+					task.wait()
+				end
+			end
+		end
+	end)
+end
+
+function Registry.stop()
+	Registry.generation += 1
+	for _, connection in Registry.connections do
+		connection:Disconnect()
+	end
+	table.clear(Registry.connections)
+end
+
+local Engine = { running = false, faults = 0, vital = {}, connections = {}, lastHeal = -math.huge }
+
+local RENDER_STEP_NAME = "SolsticeEngine"
+
+-- Games sometimes delete what we made (a respawn handler that clears
+-- Lighting, a zone script that replaces the Sky). Every two seconds the
+-- engine checks its essential instances and, if one is gone, rebuilds
+-- everything cleanly instead of carrying on half-broken.
+function Engine.heal()
+	for _, instance in Engine.vital do
+		if instance.Parent == nil then
+			if os.clock() - Engine.lastHeal < 5 then
+				return
+			end
+			Engine.lastHeal = os.clock()
+			Engine.stop()
+			Engine.start()
+			return
+		end
+	end
+end
+
+-- After a respawn, or when the game swaps the camera, everything cached about
+-- the old state is dropped so the next frame re-asserts the full look.
+function Engine.refresh()
+	forget(Lighting)
+	for _, instance in { Fx.atmosphere, Fx.sky, Fx.clouds, Fx.terrain } do
+		forget(instance)
+	end
+	sim.timers.filter = nil -- rebuild the ray filters with the new character
+	sim.lastFov = -1 -- re-learn the game's own field of view
+	sim.tiltBase = nil
+	sim.tiltWritten = nil
+	sim.lastLook = nil
+end
+
+function Engine.frame(rawDt)
+	local camera = Workspace.CurrentCamera
+	if not camera then
+		return
+	end
+	-- Clamp the step so a long hitch cannot fling the smoothed values around.
+	local dt = math.min(rawDt, 0.1)
+	sim.time += dt
+
+	local cameraFrame = camera.CFrame
+	F.camera = camera
+	F.rawDt = rawDt
+	F.camPos = cameraFrame.Position
+	F.look = cameraFrame.LookVector
+
+	Adaptive.update(rawDt)
+	if every("heal", 2, dt) then
+		Engine.heal()
+		if not Engine.running then
+			return
+		end
+	end
+
+	Stage.clock(dt)
+	Stage.sun()
+	Stage.weather(dt)
+	Stage.probes(dt)
+	Stage.water(dt)
+	Stage.sky(dt) -- before lighting: the aurora feeds the ambient glow
+	Stage.lighting(dt)
+	Stage.terrain(dt)
+	Stage.particles(dt)
+	Stage.puddles(dt)
+	Lights.update(dt)
+	Contact.update(dt)
+	Surfaces.update(dt)
+	Stage.post(dt)
+	Stage.camera(dt)
+	Overlay.update(dt)
+end
+
+-- A script error inside a render step would otherwise repeat sixty times a
+-- second. The first fault is reported; if they keep coming the shaders shut
+-- themselves off cleanly instead of flooding the output.
+function Engine.step(rawDt)
+	local ok, message = pcall(Engine.frame, rawDt)
+	if not ok then
+		Engine.faults += 1
+		if Engine.faults == 1 then
+			warn("[Solstice] frame error: " .. tostring(message))
+		elseif Engine.faults > 60 then
+			warn("[Solstice] too many errors, switching off")
+			Settings.setEnabled(false)
+		end
+	end
+end
+
+function Engine.start()
+	if Engine.running then
+		return
+	end
+	Engine.running = true
+	Engine.faults = 0
+
+	Renderer.request()
+	Baseline.capture()
+	Baseline.suppress()
+	Baseline.adopt(SoundService, { "AmbientReverb" })
+
+	Fx.atmosphere = Baseline.acquire(Lighting, "Atmosphere", "SolsticeAtmosphere", Look.atmosphereProperties)
+	Fx.sky = Baseline.acquire(Lighting, "Sky", "SolsticeSky", Look.skyProperties)
+	Fx.skyBase = { sun = Fx.sky.SunAngularSize, moon = Fx.sky.MoonAngularSize }
+
+	local terrain = Workspace:FindFirstChildOfClass("Terrain")
+	Fx.terrain = terrain
+	if terrain then
+		Baseline.adopt(terrain, Look.waterProperties)
+		Fx.clouds = Baseline.acquire(terrain, "Clouds", "SolsticeClouds", Look.cloudProperties)
+	end
+
+	Stage.createEffects()
+	World.start()
+	Spectacle.start()
+	Lights.start()
+	Contact.start()
+	Underwater.start()
+	Overlay.start()
+	Registry.start()
+
+	table.clear(Engine.vital)
+	for _, instance in { Fx.bloom, Fx.sunRays, Fx.color, Fx.dof, Fx.blur, Fx.atmosphere, Fx.sky, Fx.clouds, Fx.world, Overlay.screen } do
+		table.insert(Engine.vital, instance)
+	end
+
+	-- Keep the write cache honest when the game changes what we wrote.
+	local connections = Engine.connections
+	for _, instance in { Lighting, Fx.atmosphere, Fx.sky, Fx.clouds, terrain } do
+		table.insert(connections, watchWrites(instance))
+	end
+	table.insert(
+		connections,
+		Workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
+			Baseline.suppressCamera(Workspace.CurrentCamera)
+			Engine.refresh()
+		end)
+	)
+	table.insert(connections, localPlayer.CharacterAdded:Connect(Engine.refresh))
+
+	sim.clock = Lighting.ClockTime
+	sim.lastLook = nil
+	sim.focusSpring = Motion.spring(1 / 60, 1, 0.82)
+	sim.afCommitted = 60
+	sim.afCandidate = 60
+	table.clear(sim.timers)
+	table.clear(sim.probeOpen)
+	Adaptive.warmup = 5
+
+	-- One step after the camera, so the camera's final CFrame is known.
+	RunService:BindToRenderStep(RENDER_STEP_NAME, Enum.RenderPriority.Camera.Value + 1, Engine.step)
+end
+
+function Engine.stop()
+	if not Engine.running then
+		return
+	end
+	Engine.running = false
+	RunService:UnbindFromRenderStep(RENDER_STEP_NAME)
+
+	for _, connection in Engine.connections do
+		connection:Disconnect()
+	end
+	table.clear(Engine.connections)
+	table.clear(Engine.vital)
+
+	Registry.stop()
+	Surfaces.releaseAll()
+	Lights.stop()
+	Contact.stop()
+	Audio.stop()
+	Stage.releaseCamera()
+	Overlay.stop()
+	Baseline.restore()
+	Renderer.release()
+	table.clear(Fx)
+
+	-- Forget ownership flags and eased state so the next start re-applies
+	-- everything from a clean slate.
+	sim.clockOwned = false
+	sim.rigOwned = false
+	sim.sunOwned = false
+	sim.waterOwned = false
+	sim.softOwned = false
+	sim.seasonApplied = 1
+	sim.coverApplied = 0
+	sim.snowCover = 0
+	sim.aurora = 0
+	sim.rainbow = 0
+	sim.stars = 0
+	sim.underwater = 0
+	sim.submerged = false
+	sim.flash = 0
+	sim.strikeQueued = false
+	sim.blur = 0
+	sim.flare = 0
+	sim.bars = 0
+	F.aurora = 0
+	Settings.setGovernor(0)
+end
+
+--------------------------------------------------------------------------------
+-- 17. INTERFACE: LAYOUT CONSTANTS AND PRIMITIVES
+--
+--     The interface is one surface that changes shape:
+--
+--       hidden  ->  dock  ->  panel
+--
+--       hidden  the dock sits off the right edge; a small handle remains
+--       dock    a floating pill of icons, revealed by moving to the edge,
+--               with macOS-style magnification under the pointer
+--       panel   the same pill, stretched leftwards into a settings window;
+--               the icons stay where they were and become the tab rail
+--
+--     Inside the panel each tab has a row of sub-tabs (its sections) under
+--     the load strip, so long tabs such as Camera > Grading stay one screen.
+--
+--     Geometry is driven by under-damped springs (the bounce), colour and
+--     opacity by short tweens.
+--------------------------------------------------------------------------------
+
+local LAYOUT = {
+	dockWidth = 56,
+	icon = 36,
+	iconGap = 6,
+	dockPadding = 10,
+	dividerGap = 15, -- space between the last tab icon and the power icon
+	panelWidth = 420,
+	panelHeight = 600,
+	edgeMargin = 12, -- gap between the surface and the screen edge
+	revealZone = 10, -- how close to the edge the pointer must come
+	hideDelay = 0.7, -- seconds the dock lingers after the pointer leaves
+	magnifyScale = 1.45, -- icon scale directly under the pointer
+	magnifyRange = 96, -- pixels over which magnification falls off
+	controlWidth = 140,
+	enterShift = 18, -- rows slide in from this far to the right
+	exitShift = 10,
+	rowStagger = 0.026, -- delay between consecutive rows entering
+	contentTop = 124, -- header (60) + load strip (24) + sub-tabs (40)
+}
+
+-- Interface state. The build functions add the instances and springs they
+-- create to this table (UI.gui, UI.holder, UI.geo, ...) as they go.
+local UI: { [string]: any } = {
+	sequence = 0, -- bumped by every open / close; stale animations check it
+	expanded = false, -- true while the surface is (or is becoming) a panel
+	closing = false, -- true while rows are animating out before the collapse
+	shown = false,
+	lastSeen = -math.huge,
+	peekUntil = 0,
+	activeTab = nil,
+	lastTab = TABS[1].id,
+	hovered = nil,
+	drag = nil, -- { update = fn(x), finish = fn() } while a slider is held
+	dock = {}, -- dock entries, top to bottom
+	dockById = {},
+	rowsByTab = {}, -- "tab/section" -> rows
+	activeSection = {}, -- tab id -> section id last shown
+	sectionBars = {}, -- tab id -> { holder, sync, sections }
+	rowsById = {},
+	allRows = {},
+	currentRows = {},
+	chrome = {}, -- header, load strip and footer animation handles
+	bounds = { left = 0, top = 0, right = 0, bottom = 0 },
+	tooltipX = 0,
+}
+
+local Widgets = {}
+
+do
+	local function corner(radius)
+		return create("UICorner", { CornerRadius = UDim.new(0, radius) })
+	end
+
+	local function outline(color, transparency)
+		return create("UIStroke", {
+			Color = color,
+			Thickness = 1,
+			Transparency = transparency or 0,
+			ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+		})
+	end
+
+	local function label(text, size, color, font, properties)
+		local base = {
+			BackgroundTransparency = 1,
+			BorderSizePixel = 0,
+			Text = text,
+			TextSize = size,
+			TextColor3 = color,
+			FontFace = font or FONT.regular,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			TextYAlignment = Enum.TextYAlignment.Center,
+		}
+		if properties then
+			for key, value in properties do
+				base[key] = value
+			end
+		end
+		return create("TextLabel", base)
+	end
+
+	local function button(properties, children)
+		local base = {
+			BackgroundTransparency = 1,
+			BorderSizePixel = 0,
+			AutoButtonColor = false,
+			Text = "",
+		}
+		for key, value in properties do
+			base[key] = value
+		end
+		return create("TextButton", base, children)
+	end
+
+	Widgets.corner = corner
+	Widgets.outline = outline
+	Widgets.label = label
+	Widgets.button = button
+
+	-- Wraps a CanvasGroup so it can slide and fade as one unit. Every piece
+	-- of panel content (header, each row, footer) is one of these, which is
+	-- what makes the sequential enter and exit animations possible.
+	function Widgets.animatable(body, basePosition)
+		local self = { body = body, visible = false }
+		self.slide = Motion.spring(LAYOUT.enterShift, 5, 0.6, function(x)
+			body.Position = basePosition + UDim2.fromOffset(x, 0)
+		end)
+		body.GroupTransparency = 1
+
+		function self.hide()
+			self.visible = false
+			self.slide:snap(LAYOUT.enterShift)
+			body.GroupTransparency = 1
+		end
+
+		-- `sequence` is the value of UI.sequence when the animation was
+		-- requested. If the player has opened or closed something else by
+		-- the time the delay elapses, the animation is simply dropped.
+		function self.enter(delay, sequence)
+			task.delay(delay, function()
+				if UI.sequence ~= sequence then
+					return
+				end
+				self.visible = true
+				self.slide:snap(LAYOUT.enterShift)
+				self.slide:to(0)
+				tween(body, 0.2, { GroupTransparency = 0 })
+			end)
+		end
+
+		function self.exit(delay, sequence)
+			task.delay(delay, function()
+				if UI.sequence ~= sequence then
+					return
+				end
+				self.visible = false
+				self.slide:to(LAYOUT.exitShift)
+				tween(body, 0.11, { GroupTransparency = 1 })
+			end)
+		end
+
+		-- Enter only if a previous enter was dropped before it could run.
+		function self.ensure(sequence)
+			if not self.visible then
+				self.enter(0, sequence)
+			end
+		end
+
+		return self
+	end
+
+	-- Four dots showing a load score of 0..4. Green is cheap, red is not.
+	function Widgets.pips(parent, order)
+		local holder = create("Frame", {
+			Name = "Load",
+			Size = UDim2.fromOffset(22, 6),
+			BackgroundTransparency = 1,
+			LayoutOrder = order,
+			Parent = parent,
+		})
+		local dots = {}
+		for index = 1, 4 do
+			dots[index] = create("Frame", {
+				Position = UDim2.fromOffset((index - 1) * 6, 1),
+				Size = UDim2.fromOffset(4, 4),
+				BackgroundColor3 = THEME.controlActive,
+				BorderSizePixel = 0,
+				Parent = holder,
+			}, { corner(2) })
+		end
+		local function set(load)
+			local color = LOAD_COLORS[math.clamp(load, 1, 4)]
+			for index, dot in dots do
+				dot.BackgroundColor3 = index <= load and color or THEME.controlActive
+			end
+		end
+		return holder, set
+	end
+
+	----------------------------------------------------------------------------
+	-- 18. CONTROLS
+	--     Each builder returns (guiObject, sync). `sync(instant)` makes the
+	--     control show the current value, animated unless `instant` is set.
+	----------------------------------------------------------------------------
+
+	-- Toggle: the knob springs across and squashes on press.
+	function Widgets.toggle(parent, read, write)
+		local track = button({
+			Name = "Toggle",
+			Size = UDim2.fromOffset(34, 20),
+			BackgroundColor3 = THEME.control,
+			BackgroundTransparency = 0,
+			Parent = parent,
+		}, { corner(10) })
+		local knob = create("Frame", {
+			AnchorPoint = Vector2.new(0, 0.5),
+			Position = UDim2.new(0, 3, 0.5, 0),
+			Size = UDim2.fromOffset(14, 14),
+			BackgroundColor3 = THEME.text,
+			BorderSizePixel = 0,
+			Parent = track,
+		}, { corner(7) })
+
+		local slide = Motion.spring(0, 5.5, 0.55, function(alpha)
+			knob.Position = UDim2.new(0, 3 + 14 * alpha, 0.5, 0)
+		end)
+		local squash = Motion.spring(14, 7, 0.5, function(width)
+			knob.Size = UDim2.fromOffset(width, 14)
+		end)
+
+		track.Activated:Connect(function()
+			local before = read()
+			write(not before)
+			if read() ~= before then
+				squash:snap(19)
+				squash:to(14)
+			end
+		end)
+
+		local function sync(instant)
+			local on = read() == true
+			if instant then
+				slide:snap(on and 1 or 0)
+				track.BackgroundColor3 = on and THEME.accent or THEME.control
+			else
+				slide:to(on and 1 or 0)
+				tween(track, 0.16, { BackgroundColor3 = on and THEME.accent or THEME.control })
+			end
+		end
+		return track, sync
+	end
+
+	-- Slider: track, fill, knob and a value read-out. Dragging is tracked
+	-- globally (see the input wiring) so the pointer can leave the track.
+	function Widgets.slider(parent, item, read, write)
+		-- The read-out is wide enough for units like "+0.25" or "45°/s".
+		local trackWidth = LAYOUT.controlWidth - 54
+		local holder = create("Frame", {
+			Name = "Slider",
+			Size = UDim2.fromOffset(LAYOUT.controlWidth, 24),
+			BackgroundTransparency = 1,
+			Parent = parent,
+		})
+		local track = create("Frame", {
+			AnchorPoint = Vector2.new(0, 0.5),
+			Position = UDim2.new(0, 6, 0.5, 0),
+			Size = UDim2.fromOffset(trackWidth, 4),
+			BackgroundColor3 = THEME.control,
+			BorderSizePixel = 0,
+			Parent = holder,
+		}, { corner(2) })
+		local fill = create("Frame", {
+			Size = UDim2.fromScale(0, 1),
+			BackgroundColor3 = THEME.accent,
+			BorderSizePixel = 0,
+			Parent = track,
+		}, { corner(2) })
+		local knob = create("Frame", {
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.fromScale(0, 0.5),
+			Size = UDim2.fromOffset(12, 12),
+			BackgroundColor3 = THEME.text,
+			BorderSizePixel = 0,
+			ZIndex = 2,
+			Parent = track,
+		}, { corner(8) })
+		local readout = label("", 11, THEME.textSecondary, FONT.medium, {
+			AnchorPoint = Vector2.new(1, 0.5),
+			Position = UDim2.new(1, 0, 0.5, 0),
+			Size = UDim2.fromOffset(48, 14),
+			TextXAlignment = Enum.TextXAlignment.Right,
+			Parent = holder,
+		})
+		local hitArea = button({
+			Name = "Hit",
+			Size = UDim2.new(0, trackWidth + 12, 1, 0),
+			ZIndex = 3,
+			Parent = holder,
+		})
+
+		local position = Motion.spring(0, 7, 0.8, function(alpha)
+			fill.Size = UDim2.fromScale(clamp01(alpha), 1)
+			knob.Position = UDim2.fromScale(alpha, 0.5)
+		end)
+		local grow = Motion.spring(12, 7, 0.5, function(size)
+			knob.Size = UDim2.fromOffset(size, size)
+		end)
+
+		local function setFromPointer(x)
+			local alpha = clamp01((x - track.AbsolutePosition.X) / math.max(track.AbsoluteSize.X, 1))
+			local value = snapToStep(item.min + alpha * (item.max - item.min), item.step)
+			write(math.clamp(value, item.min, item.max))
+		end
+
+		hitArea.InputBegan:Connect(function(input)
+			local kind = input.UserInputType
+			if kind == Enum.UserInputType.MouseButton1 or kind == Enum.UserInputType.Touch then
+				UI.drag = {
+					update = setFromPointer,
+					finish = function()
+						grow:to(12)
+					end,
+				}
+				grow:to(17)
+				setFromPointer(input.Position.X)
+			end
+		end)
+
+		local function sync(instant)
+			local value = read()
+			local alpha = (value - item.min) / (item.max - item.min)
+			if instant then
+				position:snap(alpha)
+			else
+				position:to(alpha)
+			end
+			readout.Text = formatValue(item, value)
+		end
+		return holder, sync
+	end
+
+	-- Segmented control: a thumb that springs between cells. Used for tiers,
+	-- short choices and the profile picker. `readEffective`, when given,
+	-- marks the cell actually in use if the governor has lowered the tier.
+	function Widgets.segmented(parent, options, width, read, write, readEffective)
+		local count = #options
+		local cell = (width - 4) / count
+		local holder = create("Frame", {
+			Name = "Segmented",
+			Size = UDim2.fromOffset(width, 26),
+			BackgroundColor3 = THEME.control,
+			BorderSizePixel = 0,
+			Parent = parent,
+		}, { corner(RADIUS.control) })
+		local thumb = create("Frame", {
+			Position = UDim2.fromOffset(2, 2),
+			Size = UDim2.fromOffset(cell, 22),
+			BackgroundColor3 = THEME.controlActive,
+			BorderSizePixel = 0,
+			Parent = holder,
+		}, { corner(RADIUS.control - 1) })
+		local marker = create("Frame", {
+			AnchorPoint = Vector2.new(0.5, 1),
+			Size = UDim2.fromOffset(10, 2),
+			BackgroundColor3 = THEME.yellow,
+			BorderSizePixel = 0,
+			Visible = false,
+			ZIndex = 3,
+			Parent = holder,
+		}, { corner(1) })
+
+		local cells = {}
+		for index, option in options do
+			local cellButton = button({
+				Position = UDim2.fromOffset(2 + (index - 1) * cell, 0),
+				Size = UDim2.new(0, cell, 1, 0),
+				Text = option,
+				TextSize = 11,
+				FontFace = FONT.medium,
+				TextColor3 = THEME.textTertiary,
+				ZIndex = 2,
+				Parent = holder,
+			})
+			cellButton.Activated:Connect(function()
+				write(index)
+			end)
+			cells[index] = cellButton
+		end
+
+		local slide = Motion.spring(2, 5.5, 0.62, function(x)
+			thumb.Position = UDim2.fromOffset(x, 2)
+		end)
+		local shownIndex = nil
+
+		local function sync(instant)
+			local index = read()
+			thumb.Visible = index ~= nil
+			if index then
+				local x = 2 + (index - 1) * cell
+				if instant or shownIndex == nil then
+					slide:snap(x)
+				else
+					slide:to(x)
+				end
+			end
+			shownIndex = index
+			for cellIndex, cellButton in cells do
+				cellButton.TextColor3 = cellIndex == index and THEME.text or THEME.textTertiary
+			end
+			local effective = index
+			if readEffective then
+				effective = readEffective()
+			end
+			local eased = index ~= nil and effective ~= index
+			marker.Visible = eased
+			if eased then
+				marker.Position = UDim2.new(0, 2 + (effective - 0.5) * cell, 1, -3)
+			end
+		end
+		return holder, sync
+	end
+
+	-- Stepper: previous / next around a label, for choices with long names.
+	-- The label slides in from the side it was summoned from.
+	function Widgets.stepper(parent, options, read, write)
+		local holder = create("Frame", {
+			Name = "Stepper",
+			Size = UDim2.fromOffset(LAYOUT.controlWidth, 26),
+			BackgroundColor3 = THEME.control,
+			BorderSizePixel = 0,
+			Parent = parent,
+		}, { corner(RADIUS.control) })
+		local window = create("Frame", {
+			Position = UDim2.fromOffset(24, 0),
+			Size = UDim2.new(1, -48, 1, 0),
+			BackgroundTransparency = 1,
+			ClipsDescendants = true,
+			Parent = holder,
+		})
+		local text = label("", 11, THEME.text, FONT.medium, {
+			Size = UDim2.fromScale(1, 1),
+			TextXAlignment = Enum.TextXAlignment.Center,
+			TextTruncate = Enum.TextTruncate.AtEnd,
+			Parent = window,
+		})
+		local slide = Motion.spring(0, 6, 0.6, function(x)
+			text.Position = UDim2.fromOffset(x, 0)
+		end)
+
+		local function step(direction)
+			local before = read()
+			write((before - 1 + direction) % #options + 1)
+			if read() ~= before then
+				slide:snap(direction * 14)
+				slide:to(0)
+				text.TextTransparency = 0.9
+				tween(text, 0.18, { TextTransparency = 0 })
+			end
+		end
+
+		for _, side in { { -1, "<", 0 }, { 1, ">", 1 } } do
+			local arrow = button({
+				AnchorPoint = Vector2.new(side[3], 0),
+				Position = UDim2.fromScale(side[3], 0),
+				Size = UDim2.new(0, 24, 1, 0),
+				Text = side[2],
+				TextSize = 12,
+				FontFace = FONT.bold,
+				TextColor3 = THEME.textTertiary,
+				Parent = holder,
+			})
+			arrow.MouseEnter:Connect(function()
+				arrow.TextColor3 = THEME.text
+			end)
+			arrow.MouseLeave:Connect(function()
+				arrow.TextColor3 = THEME.textTertiary
+			end)
+			arrow.Activated:Connect(function()
+				step(side[1])
+			end)
+		end
+
+		local function sync()
+			text.Text = options[read()]
+		end
+		return holder, sync
+	end
+
+	----------------------------------------------------------------------------
+	-- 19. ROWS
+	--     One schema item becomes one row: name, load pips, optional lock
+	--     badge and hint on the left, its control on the right.
+	----------------------------------------------------------------------------
+
+	function Widgets.row(item, order)
+		-- Section heading.
+		if item.kind == "group" then
+			local slot = create("Frame", {
+				Name = "Group",
+				Size = UDim2.new(1, 0, 0, 30),
+				BackgroundTransparency = 1,
+				LayoutOrder = order,
+			})
+			local body = create("CanvasGroup", {
+				Size = UDim2.fromScale(1, 1),
+				BackgroundTransparency = 1,
+				BorderSizePixel = 0,
+				Parent = slot,
+			})
+			label(string.upper(item.name), 10, THEME.textTertiary, FONT.bold, {
+				Position = UDim2.fromOffset(10, 12),
+				Size = UDim2.new(1, -20, 0, 14),
+				Parent = body,
+			})
+			local function nothing() end
+			return { slot = slot, anim = Widgets.animatable(body, UDim2.new()), sync = nothing, conditions = nothing }
+		end
+
+		local tall = item.hint ~= nil
+		local height = tall and 54 or 38
+		local centre = tall and 19 or height / 2
+
+		local slot = create("Frame", {
+			Name = item.key,
+			Size = UDim2.new(1, 0, 0, height),
+			BackgroundTransparency = 1,
+			LayoutOrder = order,
+		})
+		local body = create("CanvasGroup", {
+			Size = UDim2.fromScale(1, 1),
+			BackgroundColor3 = THEME.surfaceRaised,
+			BackgroundTransparency = 1,
+			BorderSizePixel = 0,
+			Parent = slot,
+		}, { corner(RADIUS.row) })
+
+		-- Name, pips and lock badge share a horizontal list so the pips sit
+		-- right after the text whatever its length.
+		local head = create("Frame", {
+			Position = UDim2.fromOffset(10, centre - 10),
+			Size = UDim2.new(1, -(LAYOUT.controlWidth + 28), 0, 20),
+			BackgroundTransparency = 1,
+			Parent = body,
+		}, {
+			create("UIListLayout", {
+				FillDirection = Enum.FillDirection.Horizontal,
+				VerticalAlignment = Enum.VerticalAlignment.Center,
+				SortOrder = Enum.SortOrder.LayoutOrder,
+				Padding = UDim.new(0, 7),
+			}),
+		})
+		label(item.name, 13, THEME.text, FONT.medium, {
+			AutomaticSize = Enum.AutomaticSize.X,
+			Size = UDim2.fromScale(0, 1),
+			LayoutOrder = 1,
+			Parent = head,
+		})
+
+		local pips, setPips = nil, nil
+		if item.maxLoad > 0 then
+			pips, setPips = Widgets.pips(head, 2)
+		end
+
+		local lock = nil
+		if item.requires then
+			lock = label(item.requiresTag or "LOCKED", 9, THEME.orange, FONT.bold, {
+				AutomaticSize = Enum.AutomaticSize.X,
+				Size = UDim2.fromOffset(0, 15),
+				BackgroundColor3 = THEME.control,
+				BackgroundTransparency = 0,
+				LayoutOrder = 3,
+				Visible = false,
+				Parent = head,
+			})
+			corner(4).Parent = lock
+			create("UIPadding", { PaddingLeft = UDim.new(0, 5), PaddingRight = UDim.new(0, 5), Parent = lock })
+		end
+
+		if tall then
+			label(item.hint, 11, THEME.textTertiary, FONT.regular, {
+				Position = UDim2.fromOffset(10, 33),
+				Size = UDim2.new(1, -20, 0, 14),
+				TextTruncate = Enum.TextTruncate.AtEnd,
+				Parent = body,
+			})
+		end
+
+		-- The control. Writes are refused while the row is locked or dimmed.
+		local function read()
+			return get(item.id)
+		end
+		local function write(value)
+			if Settings.isEnabled(item) then
+				Settings.set(item.id, value)
+			end
+		end
+
+		local control, syncControl
+		if item.kind == "toggle" then
+			control, syncControl = Widgets.toggle(body, read, write)
+		elseif item.kind == "slider" then
+			control, syncControl = Widgets.slider(body, item, read, write)
+		elseif item.kind == "tier" then
+			control, syncControl = Widgets.segmented(body, item.options, LAYOUT.controlWidth, read, write, function()
+				return Settings.tier(item.id)
+			end)
+		elseif #item.options <= 3 then
+			control, syncControl = Widgets.segmented(body, item.options, LAYOUT.controlWidth, read, write, nil)
+		else
+			control, syncControl = Widgets.stepper(body, item.options, read, write)
+		end
+		control.AnchorPoint = Vector2.new(1, 0.5)
+		control.Position = UDim2.new(1, -8, 0, centre)
+
+		slot.MouseEnter:Connect(function()
+			tween(body, 0.12, { BackgroundTransparency = 0 })
+		end)
+		slot.MouseLeave:Connect(function()
+			tween(body, 0.2, { BackgroundTransparency = 1 })
+		end)
+
+		-- Things that depend on *other* settings: whether the row is usable,
+		-- what it currently costs, and whether its lock badge shows.
+		local function conditions()
+			local available = Settings.isAvailable(item)
+			body.GroupColor3 = Settings.isEnabled(item) and THEME.white or THEME.disabledTint
+			if pips and setPips then
+				pips.Visible = available
+				setPips(Settings.itemLoad(item))
+			end
+			if lock then
+				lock.Visible = not available
+			end
+		end
+
+		local row = {
+			slot = slot,
+			anim = Widgets.animatable(body, UDim2.new()),
+			sync = syncControl,
+			conditions = conditions,
+		}
+		syncControl(true)
+		conditions()
+		return row
+	end
+end
+
+--------------------------------------------------------------------------------
+-- 20. DOCK ICONS
+--     Drawn from rounded frames and strokes so the script needs no uploaded
+--     images. Every shape is sized in fractions of the icon, so the same
+--     drawing scales cleanly while the dock magnifies it.
+--------------------------------------------------------------------------------
+
+local Glyph = {}
+
+do
+	local function ring(canvas, parts, width, height, x, y, rotation, roundness)
+		local frame = create("Frame", {
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.fromScale(x, y),
+			Size = UDim2.fromScale(width, height),
+			Rotation = rotation or 0,
+			BackgroundTransparency = 1,
+			BorderSizePixel = 0,
+			Parent = canvas,
+		}, { create("UICorner", { CornerRadius = UDim.new(roundness or 0.5, 0) }) })
+		local stroke = create("UIStroke", {
+			Thickness = 1.5,
+			Color = THEME.textSecondary,
+			ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+			Parent = frame,
+		})
+		table.insert(parts, { instance = stroke, property = "Color" })
+	end
+
+	local function fill(canvas, parts, width, height, x, y, rotation, roundness)
+		local frame = create("Frame", {
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.fromScale(x, y),
+			Size = UDim2.fromScale(width, height),
+			Rotation = rotation or 0,
+			BackgroundColor3 = THEME.textSecondary,
+			BorderSizePixel = 0,
+			Parent = canvas,
+		}, { create("UICorner", { CornerRadius = UDim.new(roundness or 0.5, 0) }) })
+		table.insert(parts, { instance = frame, property = "BackgroundColor3" })
+	end
+
+	local DRAW = {
+		-- Atmosphere: a sun.
+		atmo = function(canvas, parts)
+			ring(canvas, parts, 0.44, 0.44, 0.5, 0.5)
+			for step = 0, 7 do
+				local angle = math.rad(step * 45)
+				fill(canvas, parts, 0.085, 0.17, 0.5 + math.sin(angle) * 0.42, 0.5 - math.cos(angle) * 0.42, step * 45)
+			end
+		end,
+		-- World: a globe.
+		world = function(canvas, parts)
+			ring(canvas, parts, 0.9, 0.9, 0.5, 0.5)
+			ring(canvas, parts, 0.4, 0.9, 0.5, 0.5)
+			fill(canvas, parts, 0.9, 0.085, 0.5, 0.5)
+		end,
+		-- Materials: a faceted gem.
+		mat = function(canvas, parts)
+			ring(canvas, parts, 0.64, 0.64, 0.5, 0.5, 45, 0.18)
+			fill(canvas, parts, 0.22, 0.22, 0.5, 0.5, 45, 0.2)
+		end,
+		-- Camera: body, lens and viewfinder bump.
+		cam = function(canvas, parts)
+			ring(canvas, parts, 0.96, 0.66, 0.5, 0.57, 0, 0.26)
+			ring(canvas, parts, 0.34, 0.34, 0.5, 0.57)
+			fill(canvas, parts, 0.32, 0.1, 0.5, 0.16)
+		end,
+		-- Fun: a sparkle with a smaller one beside it.
+		fun = function(canvas, parts)
+			fill(canvas, parts, 0.11, 0.8, 0.42, 0.58)
+			fill(canvas, parts, 0.8, 0.11, 0.42, 0.58)
+			fill(canvas, parts, 0.28, 0.28, 0.42, 0.58, 45, 0.2)
+			fill(canvas, parts, 0.07, 0.3, 0.85, 0.17)
+			fill(canvas, parts, 0.3, 0.07, 0.85, 0.17)
+		end,
+		-- Power: the standby symbol.
+		power = function(canvas, parts)
+			ring(canvas, parts, 0.8, 0.8, 0.5, 0.56)
+			fill(canvas, parts, 0.1, 0.46, 0.5, 0.2)
+		end,
+	}
+
+	-- Returns the list of colourable parts making up the icon.
+	function Glyph.build(parent, id)
+		local parts = {}
+		local asset = CONFIG.IconAssets[id]
+		if asset and asset ~= "" then
+			local image = create("ImageLabel", {
+				AnchorPoint = Vector2.new(0.5, 0.5),
+				Position = UDim2.fromScale(0.5, 0.5),
+				Size = UDim2.fromScale(0.5, 0.5),
+				BackgroundTransparency = 1,
+				Image = asset,
+				ImageColor3 = THEME.textSecondary,
+				Parent = parent,
+			})
+			table.insert(parts, { instance = image, property = "ImageColor3" })
+			return parts
+		end
+		local canvas = create("Frame", {
+			Name = "Glyph",
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.fromScale(0.5, 0.5),
+			Size = UDim2.fromScale(0.5, 0.5),
+			BackgroundTransparency = 1,
+			Parent = parent,
+		})
+		DRAW[id](canvas, parts)
+		return parts
+	end
+
+	function Glyph.paint(parts, color)
+		for _, part in parts do
+			tween(part.instance, 0.14, { [part.property] = color })
+		end
+	end
+end
+
+--------------------------------------------------------------------------------
+-- 21. THE SURFACE: BUILD, MORPH AND PER-FRAME BEHAVIOUR
+--------------------------------------------------------------------------------
+
+-- The outer shell: handle, drop shadow, the morphing surface and its two
+-- regions (page on the left, icon rail on the right).
+function UI.buildShell()
+	local L = LAYOUT
+	local corner, outline, button = Widgets.corner, Widgets.outline, Widgets.button
+
+	local gui = create("ScreenGui", {
+		Name = "SolsticeInterface",
+		ResetOnSpawn = false,
+		IgnoreGuiInset = true,
+		DisplayOrder = 9000,
+		ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+	})
+	UI.gui = gui
+
+	-- The sliver that stays on screen while the dock is hidden.
+	UI.handle = create("Frame", {
+		Name = "Handle",
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, -3, 0.5, 0),
+		Size = UDim2.fromOffset(4, 44),
+		BackgroundColor3 = THEME.borderStrong,
+		BackgroundTransparency = 0.25,
+		BorderSizePixel = 0,
+		Parent = gui,
+	}, { corner(2) })
+
+	-- Touch screens have no hover, so tapping the edge reveals the dock.
+	local touchStrip = button({
+		Name = "TouchStrip",
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, 0, 0.5, 0),
+		Size = UDim2.fromOffset(16, 120),
+		Parent = gui,
+	})
+	touchStrip.Activated:Connect(function()
+		UI.peekUntil = os.clock() + 4
+	end)
+
+	-- A visible Modal button releases the mouse in first person and shift
+	-- lock, so the panel stays usable when opened from the keyboard.
+	UI.modal = button({
+		Name = "MouseRelease",
+		Size = UDim2.fromOffset(1, 1),
+		Modal = true,
+		Visible = false,
+		Parent = gui,
+	})
+
+	local holder = create("Frame", {
+		Name = "Surface",
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, L.dockWidth + 10, 0.5, 0),
+		Size = UDim2.fromOffset(L.dockWidth, 100),
+		BackgroundTransparency = 1,
+		Parent = gui,
+	})
+	UI.holder = holder
+
+	-- Three stacked translucent frames stand in for a soft drop shadow.
+	for layer = 1, 3 do
+		create("Frame", {
+			Name = "Shadow",
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.new(0.5, 0, 0.5, 2 + layer * 2),
+			Size = UDim2.new(1, layer * 6, 1, layer * 6),
+			BackgroundColor3 = rgb(0, 0, 0),
+			BackgroundTransparency = 0.8 + layer * 0.05,
+			BorderSizePixel = 0,
+			ZIndex = 0,
+			Parent = holder,
+		}, { corner(RADIUS.dock + layer * 3) })
+	end
+
+	local shell = create("Frame", {
+		Name = "Shell",
+		Size = UDim2.fromScale(1, 1),
+		BackgroundColor3 = THEME.surface,
+		BorderSizePixel = 0,
+		Active = true, -- swallow clicks so they do not reach the game
+		ZIndex = 1,
+		Parent = holder,
+	})
+	UI.shellCorner = corner(RADIUS.dock)
+	UI.shellCorner.Parent = shell
+	outline(THEME.border).Parent = shell
+
+	-- The page keeps its final width at all times and is clipped by `content`,
+	-- which grows with the shell. So the morph reveals the page rather than
+	-- reflowing it, and nothing inside has to re-layout while it animates.
+	local content = create("Frame", {
+		Name = "Content",
+		Size = UDim2.new(1, -L.dockWidth, 1, 0),
+		BackgroundTransparency = 1,
+		ClipsDescendants = true,
+		Visible = false,
+		Parent = shell,
+	})
+	UI.content = content
+
+	local page = create("Frame", {
+		Name = "Page",
+		AnchorPoint = Vector2.new(1, 0),
+		Position = UDim2.fromScale(1, 0),
+		Size = UDim2.new(0, L.panelWidth - L.dockWidth, 1, 0),
+		BackgroundTransparency = 1,
+		Parent = content,
+	})
+
+	UI.divider = create("Frame", {
+		Name = "Divider",
+		AnchorPoint = Vector2.new(1, 0),
+		Position = UDim2.new(1, 0, 0, 12),
+		Size = UDim2.new(0, 1, 1, -24),
+		BackgroundColor3 = THEME.border,
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		Parent = content,
+	})
+
+	local rail = create("Frame", {
+		Name = "Rail",
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.fromScale(1, 0.5),
+		Size = UDim2.new(0, L.dockWidth, 1, 0),
+		BackgroundTransparency = 1,
+		ZIndex = 3,
+		Parent = shell,
+	})
+
+	-- Springs for the surface geometry. These are read every frame in
+	-- UI.step rather than each writing to the instance themselves, because
+	-- size and position depend on several of them at once.
+	UI.geo = {
+		width = Motion.spring(L.dockWidth, 3.4, 0.72),
+		height = Motion.spring(100, 3.4, 0.72),
+		radius = Motion.spring(RADIUS.dock, 4, 1),
+		hide = Motion.spring(L.dockWidth + L.edgeMargin + 10, 3.6, 0.68),
+	}
+
+	return page, rail
+end
+
+-- Header, load strip, scrolling list of rows and footer.
+function UI.buildPage(page)
+	local corner, outline, label, button = Widgets.corner, Widgets.outline, Widgets.label, Widgets.button
+	local chrome = UI.chrome
+
+	---- Header -----------------------------------------------------------------
+	local header = create("CanvasGroup", {
+		Name = "Header",
+		Size = UDim2.new(1, 0, 0, 60),
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		Parent = page,
+	})
+	chrome.header = Widgets.animatable(header, UDim2.new())
+
+	local titleBlock = create("CanvasGroup", {
+		Name = "Title",
+		Size = UDim2.new(1, -190, 1, 0),
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		Parent = header,
+	})
+	chrome.title = Widgets.animatable(titleBlock, UDim2.new())
+	UI.title = label("", 15, THEME.text, FONT.bold, {
+		Position = UDim2.fromOffset(18, 14),
+		Size = UDim2.new(1, -18, 0, 18),
+		Parent = titleBlock,
+	})
+	UI.blurb = label("", 11, THEME.textTertiary, FONT.regular, {
+		Position = UDim2.fromOffset(18, 35),
+		Size = UDim2.new(1, -18, 0, 14),
+		Parent = titleBlock,
+	})
+
+	-- Which lighting pipeline is live, and at what graphics quality.
+	local chip = create("Frame", {
+		Name = "Renderer",
+		AnchorPoint = Vector2.new(1, 0),
+		Position = UDim2.new(1, -44, 0, 14),
+		Size = UDim2.fromOffset(0, 22),
+		AutomaticSize = Enum.AutomaticSize.X,
+		BackgroundColor3 = THEME.control,
+		BorderSizePixel = 0,
+		Parent = header,
+	}, {
+		corner(RADIUS.chip),
+		create("UIPadding", { PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8) }),
+		create("UIListLayout", {
+			FillDirection = Enum.FillDirection.Horizontal,
+			VerticalAlignment = Enum.VerticalAlignment.Center,
+			SortOrder = Enum.SortOrder.LayoutOrder,
+			Padding = UDim.new(0, 6),
+		}),
+	})
+	UI.rendererDot = create("Frame", {
+		Size = UDim2.fromOffset(6, 6),
+		BackgroundColor3 = THEME.green,
+		BorderSizePixel = 0,
+		LayoutOrder = 1,
+		Parent = chip,
+	}, { corner(3) })
+	UI.rendererText = label("", 10, THEME.textSecondary, FONT.medium, {
+		AutomaticSize = Enum.AutomaticSize.X,
+		Size = UDim2.fromScale(0, 1),
+		LayoutOrder = 2,
+		Parent = chip,
+	})
+
+	local close = button({
+		Name = "Close",
+		AnchorPoint = Vector2.new(1, 0),
+		Position = UDim2.new(1, -12, 0, 13),
+		Size = UDim2.fromOffset(24, 24),
+		BackgroundColor3 = THEME.control,
+		Parent = header,
+	}, { corner(RADIUS.control) })
+	for _, rotation in { 45, -45 } do
+		create("Frame", {
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.fromScale(0.5, 0.5),
+			Size = UDim2.fromOffset(11, 2),
+			Rotation = rotation,
+			BackgroundColor3 = THEME.textSecondary,
+			BorderSizePixel = 0,
+			Parent = close,
+		})
+	end
+	close.MouseEnter:Connect(function()
+		tween(close, 0.12, { BackgroundTransparency = 0 })
+	end)
+	close.MouseLeave:Connect(function()
+		tween(close, 0.2, { BackgroundTransparency = 1 })
+	end)
+	close.Activated:Connect(function()
+		UI.close()
+	end)
+
+	---- Load strip -------------------------------------------------------------
+	local strip = create("CanvasGroup", {
+		Name = "LoadStrip",
+		Size = UDim2.new(1, 0, 0, 24),
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		Parent = page,
+	})
+	chrome.strip = Widgets.animatable(strip, UDim2.fromOffset(0, 60))
+	label("LOAD", 9, THEME.textTertiary, FONT.bold, {
+		Position = UDim2.fromOffset(18, 0),
+		Size = UDim2.new(0, 34, 1, 0),
+		Parent = strip,
+	})
+	local meter = create("Frame", {
+		AnchorPoint = Vector2.new(0, 0.5),
+		Position = UDim2.new(0, 56, 0.5, 0),
+		Size = UDim2.new(1, -166, 0, 4),
+		BackgroundColor3 = THEME.control,
+		BorderSizePixel = 0,
+		Parent = strip,
+	}, { corner(2) })
+	local loadFill = create("Frame", {
+		Size = UDim2.fromScale(0, 1),
+		BackgroundColor3 = THEME.green,
+		BorderSizePixel = 0,
+		Parent = meter,
+	}, { corner(2) })
+	UI.loadFill = loadFill
+	UI.loadText = label("", 10, THEME.textSecondary, FONT.medium, {
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, -18, 0.5, 0),
+		Size = UDim2.fromOffset(96, 14),
+		TextXAlignment = Enum.TextXAlignment.Right,
+		Parent = strip,
+	})
+	UI.loadSpring = Motion.spring(0, 4, 0.6, function(alpha)
+		loadFill.Size = UDim2.fromScale(clamp01(alpha), 1)
+	end)
+
+	---- Sub-tabs ---------------------------------------------------------------
+	-- Each tab's sections as a segmented control: a tab inside the tab. One
+	-- control per tab is built up front; only the active tab's is visible.
+	local subtabs = create("CanvasGroup", {
+		Name = "SubTabs",
+		Size = UDim2.new(1, 0, 0, 40),
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		Parent = page,
+	})
+	chrome.subtabs = Widgets.animatable(subtabs, UDim2.fromOffset(0, 84))
+	local barWidth = LAYOUT.panelWidth - LAYOUT.dockWidth - 36
+	for _, tab in TABS do
+		local titles, ids = {}, {}
+		for index, section in tab.sections do
+			titles[index] = section.title
+			ids[index] = section.id
+		end
+		UI.activeSection[tab.id] = ids[1]
+		local control, sync = Widgets.segmented(subtabs, titles, barWidth, function()
+			return table.find(ids, UI.activeSection[tab.id])
+		end, function(index)
+			UI.openSection(tab.id, ids[index])
+		end, nil)
+		control.Position = UDim2.fromOffset(18, 6)
+		control.Visible = false
+		UI.sectionBars[tab.id] = { holder = control, sync = sync }
+	end
+
+	---- Rows -------------------------------------------------------------------
+	UI.scroll = create("ScrollingFrame", {
+		Name = "Rows",
+		Position = UDim2.fromOffset(0, LAYOUT.contentTop),
+		Size = UDim2.new(1, 0, 1, -(LAYOUT.contentTop + 54)),
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		CanvasSize = UDim2.new(),
+		AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		ScrollingDirection = Enum.ScrollingDirection.Y,
+		ScrollBarThickness = 3,
+		ScrollBarImageColor3 = THEME.borderStrong,
+		Parent = page,
+	}, {
+		create("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder }),
+		create("UIPadding", {
+			PaddingLeft = UDim.new(0, 8),
+			PaddingRight = UDim.new(0, 8),
+			PaddingBottom = UDim.new(0, 8),
+		}),
+	})
+
+	-- Every section's rows are built once up front and simply re-parented
+	-- when shown, so switching tabs or sections never constructs instances.
+	for _, tab in TABS do
+		for _, section in tab.sections do
+			local rows = {}
+			for order, item in section.items do
+				local row = Widgets.row(item, order)
+				table.insert(rows, row)
+				table.insert(UI.allRows, row)
+				if item.id then
+					UI.rowsById[item.id] = row
+				end
+			end
+			UI.rowsByTab[tab.id .. "/" .. section.id] = rows
+		end
+	end
+
+	---- Footer -----------------------------------------------------------------
+	local footer = create("CanvasGroup", {
+		Name = "Footer",
+		Size = UDim2.new(1, 0, 0, 54),
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		Parent = page,
+	})
+	chrome.footer = Widgets.animatable(footer, UDim2.new(0, 0, 1, -54))
+	create("Frame", {
+		Position = UDim2.fromOffset(18, 0),
+		Size = UDim2.new(1, -36, 0, 1),
+		BackgroundColor3 = THEME.border,
+		BorderSizePixel = 0,
+		Parent = footer,
+	})
+
+	-- Profiles set every performance tier in one go.
+	local profile, profileSync = Widgets.segmented(footer, { "Low", "Med", "High", "Ultra" }, 168, function()
+		return Settings.profile
+	end, Settings.applyProfile, nil)
+	profile.Position = UDim2.fromOffset(18, 15)
+	UI.profileSync = profileSync
+
+	local adaptive = button({
+		Name = "Adaptive",
+		AnchorPoint = Vector2.new(1, 0),
+		Position = UDim2.new(1, -74, 0, 15),
+		Size = UDim2.fromOffset(78, 26),
+		BackgroundColor3 = THEME.control,
+		BackgroundTransparency = 0,
+		Parent = footer,
+	}, { corner(RADIUS.control) })
+	UI.adaptiveDot = create("Frame", {
+		AnchorPoint = Vector2.new(0, 0.5),
+		Position = UDim2.new(0, 9, 0.5, 0),
+		Size = UDim2.fromOffset(6, 6),
+		BackgroundColor3 = THEME.green,
+		BorderSizePixel = 0,
+		Parent = adaptive,
+	}, { corner(3) })
+	UI.adaptiveText = label("Adaptive", 10, THEME.text, FONT.medium, {
+		Position = UDim2.fromOffset(21, 0),
+		Size = UDim2.new(1, -24, 1, 0),
+		Parent = adaptive,
+	})
+	adaptive.Activated:Connect(function()
+		Settings.setAdaptive(not Settings.adaptive)
+	end)
+
+	local reset = button({
+		Name = "Reset",
+		AnchorPoint = Vector2.new(1, 0),
+		Position = UDim2.new(1, -18, 0, 15),
+		Size = UDim2.fromOffset(50, 26),
+		Text = "Reset",
+		TextSize = 11,
+		FontFace = FONT.medium,
+		TextColor3 = THEME.textSecondary,
+		Parent = footer,
+	}, { corner(RADIUS.control), outline(THEME.border) })
+	reset.MouseEnter:Connect(function()
+		reset.TextColor3 = THEME.text
+	end)
+	reset.MouseLeave:Connect(function()
+		reset.TextColor3 = THEME.textSecondary
+	end)
+	reset.Activated:Connect(Settings.reset)
+end
+
+-- The icon rail, the highlight behind the active tab, and the shared tooltip.
+function UI.buildDock(rail)
+	local L = LAYOUT
+	local corner, outline, label, button = Widgets.corner, Widgets.outline, Widgets.label, Widgets.button
+
+	UI.tabHighlight = create("Frame", {
+		Name = "ActiveTab",
+		AnchorPoint = Vector2.new(1, 0.5),
+		Size = UDim2.fromOffset(0, 0),
+		BackgroundColor3 = THEME.control,
+		BorderSizePixel = 0,
+		ZIndex = 1,
+		Parent = rail,
+	}, { corner(10) })
+	UI.highlightSize = Motion.spring(0, 5, 0.55)
+	UI.highlightY = Motion.spring(0, 5, 0.65)
+
+	UI.railDivider = create("Frame", {
+		Name = "Divider",
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Size = UDim2.fromOffset(18, 1),
+		BackgroundColor3 = THEME.border,
+		BorderSizePixel = 0,
+		Parent = rail,
+	})
+
+	local entries = {}
+	for _, tab in TABS do
+		table.insert(entries, { id = tab.id, title = tab.title, kind = "tab" })
+	end
+	table.insert(entries, { id = "power", title = "Shaders", kind = "power" })
+
+	-- Resting layout: each entry's vertical centre relative to the dock's.
+	local offset = 0
+	for index, entry in entries do
+		entry.gap = index == 1 and 0 or (entry.kind == "power" and L.dividerGap or L.iconGap)
+		offset += entry.gap
+		entry.restTop = offset
+		offset += L.icon
+	end
+	UI.dockRest = offset
+
+	for _, entry in entries do
+		entry.restOffset = entry.restTop + L.icon / 2 - offset / 2
+		entry.centre = entry.restOffset
+		entry.size = L.icon
+		entry.button = button({
+			Name = entry.id,
+			AnchorPoint = Vector2.new(1, 0.5),
+			Size = UDim2.fromOffset(L.icon, L.icon),
+			ZIndex = 2,
+			Parent = rail,
+		})
+		entry.parts = Glyph.build(entry.button, entry.id)
+		entry.scale = Motion.spring(1, 5, 0.62) -- magnification
+		entry.press = Motion.spring(1, 5, 0.42) -- click bounce
+		entry.button.Activated:Connect(function()
+			entry.press:snap(0.82)
+			entry.press:to(1)
+			if entry.kind == "power" then
+				Settings.setEnabled(not Settings.enabled)
+			else
+				UI.open(entry.id)
+			end
+		end)
+		UI.dockById[entry.id] = entry
+	end
+	UI.dock = entries
+
+	-- One tooltip shared by all icons. It glides between them instead of
+	-- blinking off and on, and pops in from the right of its resting place.
+	local tooltip = create("Frame", {
+		Name = "Tooltip",
+		AnchorPoint = Vector2.new(1, 0.5),
+		Size = UDim2.fromOffset(0, 26),
+		AutomaticSize = Enum.AutomaticSize.X,
+		BackgroundColor3 = THEME.surfaceRaised,
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		ZIndex = 20,
+		Parent = UI.gui,
+	}, {
+		corner(RADIUS.control),
+		create("UIPadding", { PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10) }),
+	})
+	UI.tooltip = tooltip
+	UI.tooltipStroke = outline(THEME.borderStrong, 1)
+	UI.tooltipStroke.Parent = tooltip
+	UI.tooltipScale = create("UIScale", { Parent = tooltip })
+	UI.tooltipText = label("", 11, THEME.text, FONT.medium, {
+		AutomaticSize = Enum.AutomaticSize.X,
+		Size = UDim2.fromScale(0, 1),
+		TextTransparency = 1,
+		Parent = tooltip,
+	})
+	UI.tooltipY = Motion.spring(0, 6, 0.7)
+	UI.tooltipPop = Motion.spring(0, 5, 0.55)
+end
+
+-- Icon colours: bright when hovered or active, green/grey for the power icon.
+function UI.paintDock()
+	for _, entry in UI.dock do
+		local color = THEME.textSecondary
+		if entry.kind == "power" then
+			color = Settings.enabled and THEME.green or THEME.textTertiary
+			if entry == UI.hovered and not Settings.enabled then
+				color = THEME.text
+			end
+		elseif entry == UI.hovered or (UI.expanded and not UI.closing and entry.id == UI.activeTab) then
+			color = THEME.text
+		end
+		if entry.color ~= color then
+			entry.color = color
+			Glyph.paint(entry.parts, color)
+		end
+	end
+end
+
+function UI.tooltipLabel(entry)
+	if entry.kind == "power" then
+		return Settings.enabled and "Shaders on" or "Shaders off"
+	end
+	return entry.title
+end
+
+function UI.setHovered(entry)
+	local previous = UI.hovered
+	UI.hovered = entry
+	UI.paintDock()
+	if entry then
+		UI.tooltipText.Text = UI.tooltipLabel(entry)
+		if not previous then
+			-- First appearance: start at the icon rather than travelling to it.
+			UI.tooltipY:snap(UI.gui.AbsoluteSize.Y / 2 + entry.centre)
+		end
+		UI.tooltipPop:to(1)
+		tween(UI.tooltip, 0.12, { BackgroundTransparency = 0 })
+		tween(UI.tooltipText, 0.12, { TextTransparency = 0 })
+		tween(UI.tooltipStroke, 0.12, { Transparency = 0 })
+	else
+		UI.tooltipPop:to(0)
+		tween(UI.tooltip, 0.1, { BackgroundTransparency = 1 })
+		tween(UI.tooltipText, 0.1, { TextTransparency = 1 })
+		tween(UI.tooltipStroke, 0.1, { Transparency = 1 })
+	end
+end
+
+-- Everything in the header and footer that reflects global state.
+function UI.syncChrome()
+	local fraction = math.min(Settings.totalLoad() / CONFIG.LoadBudget, 1)
+	local text = string.format("%d%%", math.floor(fraction * 100 + 0.5))
+	if not Settings.enabled then
+		fraction = 0
+		text = "off"
+	elseif Settings.governor > 0 then
+		text ..= "  eased " .. Settings.governor
+	end
+	UI.loadSpring:to(fraction)
+	UI.loadFill.BackgroundColor3 = fraction < 0.45 and THEME.green or (fraction < 0.75 and THEME.yellow or THEME.red)
+	UI.loadText.Text = text
+	UI.loadText.TextColor3 = Settings.governor > 0 and THEME.yellow or THEME.textSecondary
+
+	UI.profileSync(false)
+	UI.adaptiveDot.BackgroundColor3 = Settings.adaptive and THEME.green or THEME.textTertiary
+	UI.adaptiveText.TextColor3 = Settings.adaptive and THEME.text or THEME.textTertiary
+
+	-- Green: full Future. Yellow: shadow maps, or Future held back by a low
+	-- graphics level. Orange: voxel lighting. Grey: could not be determined.
+	local dot = THEME.textTertiary
+	if Renderer.futureClass then
+		dot = Caps.localLightShadows and THEME.green or THEME.yellow
+	elseif Renderer.technology == "ShadowMap" then
+		dot = THEME.yellow
+	elseif Renderer.technology ~= "Unknown" then
+		dot = THEME.orange
+	end
+	UI.rendererDot.BackgroundColor3 = dot
+	UI.rendererText.Text = Renderer.describe()
+
+	UI.paintDock()
+end
+
+-- Swap the scrolling list over to a tab's current section (rows start hidden).
+function UI.populate(tabId)
+	for _, row in UI.currentRows do
+		row.slot.Parent = nil
+	end
+	local tab = nil
+	for _, candidate in TABS do
+		if candidate.id == tabId then
+			tab = candidate
+		end
+	end
+	UI.currentRows = UI.rowsByTab[tabId .. "/" .. UI.activeSection[tabId]]
+	for _, row in UI.currentRows do
+		row.anim.hide()
+		row.slot.Parent = UI.scroll
+	end
+	UI.title.Text = tab.title
+	UI.blurb.Text = tab.blurb
+	UI.scroll.CanvasPosition = Vector2.zero
+	for id, bar in UI.sectionBars do
+		bar.holder.Visible = id == tabId
+	end
+	UI.sectionBars[tabId].sync(true)
+end
+
+-- Switch the sub-tab. The rows swap with the same leave / arrive motion as
+-- a tab change, while the header stays put.
+function UI.openSection(tabId, sectionId)
+	if UI.activeSection[tabId] == sectionId then
+		return
+	end
+	UI.activeSection[tabId] = sectionId
+	UI.sectionBars[tabId].sync(false)
+	if not UI.expanded or UI.closing or UI.activeTab ~= tabId then
+		return
+	end
+	UI.sequence += 1
+	local sequence = UI.sequence
+	local chrome = UI.chrome
+	local rows = UI.currentRows
+	local count = #rows
+	for index, row in rows do
+		row.anim.exit(math.min((count - index) * 0.006, 0.08), sequence)
+	end
+	task.delay(0.15, function()
+		if UI.sequence ~= sequence then
+			return
+		end
+		UI.populate(tabId)
+		for _, part in { chrome.header, chrome.title, chrome.strip, chrome.subtabs, chrome.footer } do
+			part.ensure(sequence)
+		end
+		UI.enterRows(sequence, 0.02)
+	end)
+end
+
+-- Rows enter one after another. Returns when the last one starts.
+function UI.enterRows(sequence, startDelay)
+	local delay = startDelay
+	for _, row in UI.currentRows do
+		row.anim.enter(delay, sequence)
+		delay += LAYOUT.rowStagger
+	end
+	return delay
+end
+
+-- Open a tab. From the dock this morphs the pill into the panel; with the
+-- panel already open it swaps the content; on the active tab it closes.
+function UI.open(tabId)
+	local wasOpen = UI.expanded and not UI.closing
+	if wasOpen and UI.activeTab == tabId then
+		UI.close()
+		return
+	end
+
+	UI.sequence += 1
+	local sequence = UI.sequence
+	local chrome = UI.chrome
+	UI.expanded = true
+	UI.closing = false
+	UI.lastTab = tabId
+
+	if wasOpen then
+		-- Old rows leave bottom-up, then the new ones arrive top-down.
+		local rows = UI.currentRows
+		local count = #rows
+		for index, row in rows do
+			row.anim.exit(math.min((count - index) * 0.006, 0.08), sequence)
+		end
+		chrome.title.exit(0, sequence)
+		chrome.subtabs.exit(0.02, sequence)
+		UI.activeTab = tabId
+		UI.paintDock()
+		task.delay(0.17, function()
+			if UI.sequence ~= sequence then
+				return
+			end
+			UI.populate(tabId)
+			chrome.title.hide()
+			chrome.title.enter(0, sequence)
+			chrome.subtabs.hide()
+			chrome.subtabs.enter(0.02, sequence)
+			-- If the previous open was interrupted before these arrived,
+			-- bring them in now.
+			chrome.header.ensure(sequence)
+			chrome.strip.ensure(sequence)
+			chrome.footer.ensure(sequence)
+			UI.enterRows(sequence, 0.03)
+		end)
+	else
+		UI.activeTab = tabId
+		UI.paintDock()
+		UI.populate(tabId)
+		for _, part in { chrome.header, chrome.title, chrome.strip, chrome.subtabs, chrome.footer } do
+			part.hide()
+		end
+		-- The surface starts stretching immediately (see UI.step); content
+		-- follows a beat behind so it lands as the panel settles.
+		chrome.header.enter(0.08, sequence)
+		chrome.title.enter(0.1, sequence)
+		chrome.strip.enter(0.13, sequence)
+		chrome.subtabs.enter(0.15, sequence)
+		local last = UI.enterRows(sequence, 0.18)
+		chrome.footer.enter(math.min(last, 0.44), sequence)
+	end
+end
+
+-- Close: content leaves in reverse order, then the panel folds back.
+function UI.close()
+	if not UI.expanded or UI.closing then
+		return
+	end
+	UI.sequence += 1
+	local sequence = UI.sequence
+	local chrome = UI.chrome
+	UI.closing = true
+	UI.paintDock()
+
+	local rows = UI.currentRows
+	local count = #rows
+	chrome.footer.exit(0, sequence)
+	for index, row in rows do
+		row.anim.exit(math.min((count - index) * 0.008, 0.12), sequence)
+	end
+	chrome.subtabs.exit(0.08, sequence)
+	chrome.strip.exit(0.1, sequence)
+	chrome.title.exit(0.12, sequence)
+	chrome.header.exit(0.13, sequence)
+
+	task.delay(0.24, function()
+		if UI.sequence ~= sequence then
+			return
+		end
+		UI.expanded = false
+		UI.closing = false
+		UI.lastSeen = os.clock() -- linger as a dock for a moment
+		task.delay(0.6, function()
+			if UI.sequence ~= sequence then
+				return
+			end
+			for _, row in UI.currentRows do
+				row.slot.Parent = nil
+			end
+			UI.currentRows = {}
+		end)
+	end)
+end
+
+function UI.toggle()
+	if UI.expanded and not UI.closing then
+		UI.close()
+	else
+		UI.open(UI.lastTab)
+	end
+end
+
+-- Runs every frame: decides whether the dock is shown, magnifies the icons
+-- under the pointer, and writes the surface geometry from its springs.
+function UI.step(dt)
+	Motion.step(math.min(dt, 0.05))
+
+	local L = LAYOUT
+	local geo = UI.geo
+	local now = os.clock()
+	local camera = Workspace.CurrentCamera
+	if not camera then
+		return
+	end
+	local viewport = camera.ViewportSize
+	local mouse = UserInputService:GetMouseLocation()
+	local centreY = viewport.Y / 2
+	local restHeight = UI.dockRest + L.dockPadding * 2
+
+	---- Morph targets ----------------------------------------------------------
+	geo.width:to(UI.expanded and L.panelWidth or L.dockWidth)
+	geo.height:to(UI.expanded and math.min(L.panelHeight, viewport.Y - 48) or restHeight)
+	geo.radius:to(UI.expanded and RADIUS.shell or RADIUS.dock)
+	local width = geo.width.value
+	-- 0 as a dock, 1 as a panel; drives everything that cross-fades.
+	local openness = clamp01((width - L.dockWidth) / (L.panelWidth - L.dockWidth))
+
+	---- Reveal on hover --------------------------------------------------------
+	local verticalDistance = math.abs(mouse.Y - centreY)
+	local atEdge = mouse.X >= viewport.X - L.revealZone and verticalDistance <= restHeight / 2 + 30
+	local overSurface = mouse.X >= viewport.X - L.edgeMargin - width - 30
+		and verticalDistance <= math.max(geo.height.value, restHeight) / 2 + 30
+	if UI.expanded or UI.closing or UI.drag or atEdge or (UI.shown and overSurface) or now < UI.peekUntil then
+		UI.lastSeen = now
+	end
+	local shouldShow = now - UI.lastSeen < L.hideDelay
+	if shouldShow ~= UI.shown then
+		UI.shown = shouldShow
+		geo.hide:to(shouldShow and 0 or L.dockWidth + L.edgeMargin + 10)
+		tween(UI.handle, 0.2, { BackgroundTransparency = shouldShow and 1 or 0.25 })
+	end
+
+	-- Tucked away with every spring at rest, nothing on screen can change,
+	-- so the layout pass below (a dozen GUI writes a frame) is skipped.
+	if not UI.shown and not UI.expanded and not UI.closing and #Motion.active == 0 then
+		if UI.hovered then
+			UI.setHovered(nil)
+		end
+		return
+	end
+
+	---- Magnification ----------------------------------------------------------
+	-- Each icon's scale depends on the pointer's distance from where the icon
+	-- rests (not where it currently is, which would feed back and jitter).
+	-- The scales are springs, so icons swell and settle with a little bounce.
+	local right = viewport.X - L.edgeMargin + geo.hide.value
+	local railLeft = right - L.dockWidth
+	local interactive = UI.shown and geo.hide.value < 24
+	local nearRail = interactive and mouse.X >= railLeft - 44
+	local maxScale = lerp(L.magnifyScale, 1.08, openness)
+
+	local total = 0
+	for _, entry in UI.dock do
+		local influence = 0
+		if nearRail then
+			local distance = math.abs(mouse.Y - (centreY + entry.restOffset))
+			influence = smoothstep(0, 1, 1 - distance / L.magnifyRange)
+		end
+		entry.scale:to(1 + (maxScale - 1) * influence)
+		entry.size = L.icon * entry.scale.value * entry.press.value
+		total += entry.gap + entry.size
+	end
+
+	-- Lay the icons out around the dock's centre. They are anchored on their
+	-- right edge, so they grow towards the middle of the screen.
+	local hovered = nil
+	local inset = (L.dockWidth - L.icon) / 2
+	local y = -total / 2
+	for _, entry in UI.dock do
+		y += entry.gap
+		local size = entry.size
+		local centre = y + size / 2
+		entry.centre = centre
+		entry.button.Size = UDim2.fromOffset(size, size)
+		entry.button.Position = UDim2.new(1, -inset, 0.5, centre)
+		if entry.kind == "power" then
+			UI.railDivider.Position = UDim2.new(0.5, 0, 0.5, y - entry.gap / 2)
+		end
+		if
+			interactive
+			and mouse.X >= right - inset - size - 4
+			and mouse.X <= right + L.edgeMargin
+			and math.abs(mouse.Y - (centreY + centre)) <= (size + L.iconGap) / 2
+		then
+			hovered = entry
+		end
+		y += size
+	end
+	if hovered ~= UI.hovered then
+		UI.setHovered(hovered)
+	end
+
+	---- Surface geometry -------------------------------------------------------
+	-- As a dock, the pill grows with its magnified icons, like the macOS dock.
+	local height = geo.height.value + (total - UI.dockRest) * (1 - openness)
+	UI.holder.Size = UDim2.fromOffset(math.max(width, 24), math.max(height, 24))
+	UI.holder.Position = UDim2.new(1, -L.edgeMargin + geo.hide.value, 0.5, 0)
+	UI.shellCorner.CornerRadius = UDim.new(0, geo.radius.value)
+	UI.content.Visible = openness > 0.02
+	UI.divider.BackgroundTransparency = 1 - openness
+	UI.modal.Visible = UI.expanded
+
+	local bounds = UI.bounds
+	bounds.left = right - width
+	bounds.right = right
+	bounds.top = centreY - height / 2
+	bounds.bottom = centreY + height / 2
+
+	---- Active tab highlight ---------------------------------------------------
+	local active = UI.expanded and not UI.closing and UI.dockById[UI.activeTab] or nil
+	UI.highlightSize:to(active and L.icon or 0)
+	if active then
+		UI.highlightY:to(active.restOffset)
+	end
+	local highlight = math.max(UI.highlightSize.value, 0)
+	UI.tabHighlight.Size = UDim2.fromOffset(highlight, highlight)
+	UI.tabHighlight.Position = UDim2.new(1, -inset - (L.icon - highlight) / 2, 0.5, UI.highlightY.value)
+
+	---- Tooltip ----------------------------------------------------------------
+	if UI.hovered then
+		UI.tooltipY:to(centreY + UI.hovered.centre)
+		UI.tooltipX = right - inset - UI.hovered.size - 8
+	end
+	local pop = UI.tooltipPop.value
+	UI.tooltip.Position = UDim2.fromOffset(UI.tooltipX + (1 - pop) * 10, UI.tooltipY.value)
+	UI.tooltipScale.Scale = 0.9 + 0.1 * pop
+end
+
+function UI.build()
+	local page, rail = UI.buildShell()
+	UI.buildPage(page)
+	UI.buildDock(rail)
+
+	-- Keep the interface in step with the settings store. A change to one
+	-- setting re-syncs that row's control; conditions (dimming, load pips,
+	-- lock badges) are cheap, so they are re-evaluated for every row.
+	Settings.onChange(function(id)
+		local row = UI.rowsById[id]
+		if row then
+			row.sync(false)
+		elseif id == "@all" or id == "@governor" then
+			for _, other in UI.allRows do
+				other.sync(false)
+			end
+		end
+		for _, other in UI.allRows do
+			other.conditions()
+		end
+		UI.syncChrome()
+		if id == "@enabled" and UI.hovered then
+			UI.tooltipText.Text = UI.tooltipLabel(UI.hovered)
+		end
+	end)
+
+	---- Input ------------------------------------------------------------------
+	local function isPointer(input)
+		local kind = input.UserInputType
+		return kind == Enum.UserInputType.MouseButton1 or kind == Enum.UserInputType.Touch
+	end
+
+	UserInputService.InputChanged:Connect(function(input)
+		local kind = input.UserInputType
+		if UI.drag and (kind == Enum.UserInputType.MouseMovement or kind == Enum.UserInputType.Touch) then
+			UI.drag.update(input.Position.X)
+		end
+	end)
+
+	UserInputService.InputEnded:Connect(function(input)
+		if UI.drag and isPointer(input) then
+			UI.drag.finish()
+			UI.drag = nil
+		end
+	end)
+
+	UserInputService.InputBegan:Connect(function(input, processed)
+		if input.KeyCode == CONFIG.ToggleKey and not processed then
+			UI.toggle()
+		elseif isPointer(input) and not processed and UI.expanded and not UI.closing then
+			-- A click that landed on the game world, outside the panel.
+			local mouse = UserInputService:GetMouseLocation()
+			local bounds = UI.bounds
+			local inside = mouse.X >= bounds.left - 8
+				and mouse.X <= bounds.right + LAYOUT.edgeMargin
+				and mouse.Y >= bounds.top - 8
+				and mouse.Y <= bounds.bottom + 8
+			if not inside then
+				UI.close()
+			end
+		end
+	end)
+
+	UI.syncChrome()
+	CollectionService:AddTag(UI.gui, OWNED_TAG)
+	UI.gui.Parent = playerGui
+end
+
+--------------------------------------------------------------------------------
+-- 22. BOOT
+--------------------------------------------------------------------------------
+
+Overlay.probe()
+Settings.load() -- settings from before a respawn or restart, if any
+UI.build()
+	
+
+-- The power icon (and the fault guard) switch the whole engine on and off.
+Settings.onChange(function(id)
+	if id == "@enabled" then
+		if Settings.enabled then
+			Engine.start()
+		else
+			Engine.stop()
+		end
+	end
+end)
+
+-- If the lighting pipeline or the graphics level changes, capabilities may
+-- have changed with it: re-evaluate every lock badge and tier.
+Renderer.onChange(function()
+	Settings.notify("@all")
+end)
+
+if Settings.enabled then
+	Engine.start()
+end
+
+local uiConnection = RunService.RenderStepped:Connect(UI.step)
+-- A destroyed script's own Destroying handler is not reliable when signals
+-- are deferred. The heartbeat above expires naturally, allowing the next copy
+-- to recover the records left on modified/owned instances.
+local shutDown = false
+script.Destroying:Connect(function()
+	if shutDown then
+		return
+	end
+	shutDown = true
+	heartbeatConnection:Disconnect()
+	uiConnection:Disconnect()
+	Engine.stop()
+	if UI.gui then
+		UI.gui:Destroy()
+	end
+	localPlayer:SetAttribute(RUNNING_ATTRIBUTE, nil)
+end)
+
+-- Show the dock for a few seconds on join so players learn where it lives.
+UI.peekUntil = os.clock() + 3
