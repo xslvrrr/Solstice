@@ -1,0 +1,6 @@
+{
+	"name": "Solstice",
+	"tree": {
+		"$path": "SolsticeShaders.client.luau"
+	}
+}
