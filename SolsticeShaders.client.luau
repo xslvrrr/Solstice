@@ -187,6 +187,7 @@ local CollectionService = game:GetService("CollectionService")
 local HttpService = game:GetService("HttpService")
 local Workspace = game:GetService("Workspace")
 local GuiService = game:GetService("GuiService")
+local TextService = game:GetService("TextService")
 
 local localPlayer = Players.LocalPlayer
 if not localPlayer then
@@ -1478,8 +1479,10 @@ local MIXER_LUTS = {
 	},
 }
 local MIXER_LUT_NAMES = {}
+local LUT_LOADS = {}
 for index, lut in MIXER_LUTS do
 	MIXER_LUT_NAMES[index] = lut.name
+	LUT_LOADS[index] = lut.name == "Neutral" and 0 or 1
 end
 
 local function applyLut(index)
@@ -1512,6 +1515,8 @@ local function mixerSection()
 		Choice("lut", "LUT", MIXER_LUT_NAMES, 2, {
 			hint = "A finished look for the mixer; edit any band to make it yours",
 			onSet = applyLut,
+			-- Any look but Neutral keeps the mixer's screen sampling running.
+			loads = LUT_LOADS,
 		}),
 	}
 	local watch = {}
@@ -1907,6 +1912,10 @@ local function whenWater()
 	return get("mat.water") > 1
 end
 
+local function whenMirrors()
+	return get("mat.mirrors") > 1 or get("mat.chrome") > 1
+end
+
 local CURSOR_STYLES = { "Game", "Dot", "Cross", "Circle", "Reticle", "Arrow" }
 
 -- Settings tab choices. The themes themselves are in section 21.
@@ -1999,6 +2008,7 @@ local TABS = {
 						enabledWhen = whenOn("atmo.atmosphere"),
 					}),
 					Toggle("caveFog", "Cave fog", false, {
+						load = 1,
 						hint = "Enclosed spaces fade into darkness",
 						enabledWhen = whenOn("atmo.atmosphere"),
 					}),
@@ -2035,15 +2045,19 @@ local TABS = {
 						enabledWhen = whenOn("atmo.nightSky"),
 					}),
 					Slider("milkyWay", "Milky Way", 0, 1, 0.01, 0, {
+						load = 1,
 						hint = "A galactic band across clear nights",
 					}),
 					Group("Shooting stars"),
-					Toggle("meteors", "Shooting stars", false),
+					Toggle("meteors", "Shooting stars", false, { load = 1 }),
 					Slider("meteorRate", "Frequency", 1, 120, 1, 6, {
+						load = 2,
+						scaled = true,
 						format = "perMinute",
 						enabledWhen = whenOn("atmo.meteors"),
 					}),
 					Toggle("meteorShower", "Meteor shower", false, {
+						load = 1,
 						hint = "Streaks radiate from one point, four times as often",
 						enabledWhen = whenOn("atmo.meteors"),
 					}),
@@ -2126,7 +2140,7 @@ local TABS = {
 				id = "weather",
 				title = "Weather",
 				items = {
-					Choice("weather", "Weather", { "Clear", "Rain", "Storm", "Snow" }, 1),
+					Choice("weather", "Weather", { "Clear", "Rain", "Storm", "Snow" }, 1, { loads = { 0, 2, 3, 2 } }),
 					Group("Rotation"),
 					Toggle("weatherCycle", "Weather rotation", false, {
 						hint = "The weather changes by itself, by the chances below",
@@ -2162,14 +2176,17 @@ local TABS = {
 						hint = "At zero the place's own wind is left alone",
 					}),
 					Toggle("lightning", "Lightning", true, {
+						load = 1,
 						enabledWhen = whenEquals("world.weather", 3),
 					}),
 					Toggle("lightningBolts", "Visible bolts", true, {
+						load = 1,
 						hint = "Forked bolts in the distance with each strike",
 						enabledWhen = whenAll(whenEquals("world.weather", 3), whenOn("world.lightning")),
 					}),
 					Group("Rainbows"),
 					Choice("rainbows", "Rainbows", { "Off", "After rain", "Always" }, 2, {
+						loads = { 0, 1, 1 },
 						hint = "After rain: opposite a low sun as the rain clears",
 					}),
 					Slider("rainbowStrength", "Rainbow strength", 0, 1, 0.01, 0.6, {
@@ -2177,6 +2194,7 @@ local TABS = {
 					}),
 					Group("Under cover"),
 					Choice("shelterRain", "Rain under cover", { "Hide", "Outside", "Through" }, 2, {
+						loads = { 0, 1, 1 },
 						hint = "Outside: keep falling beyond your shelter, seen through windows",
 						enabledWhen = whenWeather,
 					}),
@@ -2213,6 +2231,7 @@ local TABS = {
 						enabledWhen = whenAll(whenOn("world.wetness"), whenAbove("world.puddles", 1)),
 					}),
 					Toggle("ripples", "Raindrop ripples", true, {
+						load = 1,
 						enabledWhen = whenAll(whenOn("world.wetness"), whenAbove("world.puddles", 1)),
 					}),
 					Toggle("splashes", "Ground splashes", true, {
@@ -2224,6 +2243,7 @@ local TABS = {
 						end,
 					}),
 					Toggle("snowCover", "Snow cover", true, {
+						load = 1,
 						hint = "Grass and ground whiten as snow settles",
 					}),
 				},
@@ -2313,9 +2333,9 @@ local TABS = {
 				id = "mirrors",
 				title = "Mirrors",
 				items = {
-					Tier("mirrors", "Real reflections", { "Off", "Puddles", "Floors", "All" }, { 0, 2, 3, 4 }, 1, {
-						hint = "Puddles, floors, then mirrors and glass reflect the world",
-						profile = { 2, 2, 3, 4 },
+					Tier("mirrors", "Real reflections", { "Off", "Puddles", "Floors" }, { 0, 2, 3 }, 1, {
+						hint = "Puddles, then the glossy floors around you, reflect the world",
+						profile = { 2, 2, 3, 3 },
 					}),
 					Slider("mirrorStrength", "Reflection strength", 0, 1, 0.01, 0.6, {
 						enabledWhen = whenAbove("mat.mirrors", 1),
@@ -2325,14 +2345,20 @@ local TABS = {
 						format = "multiplier",
 						enabledWhen = whenAbove("mat.mirrors", 2),
 					}),
-					Slider("mirrorDetail", "Reflected detail", 20, 800, 10, 250, {
-						hint = "How many nearby structures a reflection shows",
-						format = "count",
-						load = 1,
+					Slider("mirrorLod", "Reflection detail", 0, 1, 0.01, 0.5, {
+						hint = "Near things in full, far ones simpler; higher keeps more, further",
+						load = 3,
+						scaled = true,
+						active = whenMirrors,
+						enabledWhen = whenMirrors,
 					}),
 					Slider("mirrorRange", "Reflection range", 40, 400, 10, 160, {
 						hint = "How far away a structure or player can be reflected",
 						format = "studs",
+						load = 2,
+						scaled = true,
+						active = whenMirrors,
+						enabledWhen = whenMirrors,
 					}),
 					Slider("mirrorDistortion", "Distortion", 0, 1, 0.01, 0.2, {
 						hint = "Ripples and waviness in the reflection",
@@ -2347,6 +2373,8 @@ local TABS = {
 						profile = { 2, 2, 3, 3 },
 					}),
 					Slider("avatarShine", "Chrome layer", 0, 1, 0.01, 0.8, {
+						load = 2,
+						scaled = true,
 						hint = "A mirror finish over every body part and accessory",
 						enabledWhen = whenAbove("mat.chrome", 1),
 					}),
@@ -2367,6 +2395,8 @@ local TABS = {
 						requiresTag = "FUTURE",
 					}),
 					Slider("shadowRange", "Shadow distance", 10, 400, 5, 120, {
+						load = 2,
+						scaled = true,
 						hint = "Lights further away than this never cast shadows",
 						format = "studs",
 						requires = "localLightShadows",
@@ -2389,6 +2419,7 @@ local TABS = {
 				items = {
 					Group("Hand light"),
 					Choice("handLight", "Hand light", { "Off", "Flashlight", "Lantern" }, 1, {
+						loads = { 0, 1, 1 },
 						hint = "A light you carry: a beam ahead, or a glow at your side",
 					}),
 					Slider("handBrightness", "Brightness", 0, 10, 0.05, 2.5, { enabledWhen = whenAbove("mat.handLight", 1) }),
@@ -2402,6 +2433,7 @@ local TABS = {
 					}),
 					Color("handColor", "Colour", rgb(255, 236, 214), { enabledWhen = whenAbove("mat.handLight", 1) }),
 					Toggle("handShadows", "Casts shadows", true, {
+						load = 2,
 						requires = "localLightShadows",
 						requiresTag = "FUTURE",
 						enabledWhen = whenAbove("mat.handLight", 1),
@@ -2432,11 +2464,13 @@ local TABS = {
 					}),
 					Group("Sky light"),
 					Toggle("lightningLight", "Lightning lights the world", false, {
+						load = 2,
 						hint = "Each strike floods the scene and throws hard shadows",
 						requires = "localLightShadows",
 						requiresTag = "FUTURE",
 					}),
 					Slider("bounceLight", "Bounce light", 0, 1, 0.01, 0, {
+						load = 1,
 						hint = "Sunlight thrown back up from the ground onto undersides",
 					}),
 				},
@@ -2486,6 +2520,7 @@ local TABS = {
 					Slider("waveSpeed", "Wave speed", 0, 1, 0.01, 0.3, { enabledWhen = whenWater }),
 					Group("Underwater"),
 					Toggle("underwater", "Underwater effects", false, {
+						load = 1,
 						hint = "Fog, colour shift and lens warp below the surface",
 					}),
 					Slider("underwaterFog", "Water fog", 0, 1, 0.01, 0.6, {
@@ -2499,6 +2534,7 @@ local TABS = {
 						enabledWhen = whenOn("mat.underwater"),
 					}),
 					Toggle("bubbles", "Bubbles", true, {
+						load = 1,
 						enabledWhen = whenOn("mat.underwater"),
 					}),
 				},
@@ -2554,6 +2590,7 @@ local TABS = {
 						enabledWhen = whenDof(2),
 					}),
 					Choice("focusMode", "Focus mode", { "Static", "Adaptive" }, 2, {
+						loads = { 0, 1 },
 						hint = "Static holds one distance; Adaptive pulls focus",
 						enabledWhen = whenDof(3),
 					}),
@@ -2662,6 +2699,7 @@ local TABS = {
 						requiresTag = "IMAGE API",
 					}),
 					Toggle("lensDrops", "Lens droplets", true, {
+						load = 1,
 						hint = "Rain and water bead on the lens",
 					}),
 					Group("Speed"),
@@ -2735,9 +2773,11 @@ local TABS = {
 					Slider("wobble", "Camera wobble", 0, 2, 0.01, 0, { hint = "A slow, seasick sway" }),
 					Group("Cursor"),
 					Choice("cursor", "Cursor", CURSOR_STYLES, 1, {
+						loads = { 0, 1, 1, 1, 0, 0 },
 						hint = "Replaces the mouse pointer",
 					}),
 					Choice("lockCursor", "Shift-lock cursor", CURSOR_STYLES, 1, {
+						loads = { 0, 1, 1, 1, 0, 0 },
 						hint = "While the mouse is locked: shift lock, first person",
 					}),
 					Slider("crosshairSize", "Size", 0.5, 3, 0.05, 1, {
@@ -2758,6 +2798,7 @@ local TABS = {
 					}),
 					Group("Colour"),
 					Toggle("avatarCycle", "Colour cycle", false, {
+						load = 1,
 						hint = "The avatar glows through a gradient, over clothes and all",
 					}),
 					Gradient("avatarGradient", "Cycle colours", {
@@ -2783,6 +2824,7 @@ local TABS = {
 					Group("Body"),
 					Toggle("headless", "Headless", false),
 					Choice("korblox", "Korblox leg", { "None", "Left", "Right", "Both" }, 1, {
+						loads = { 0, 1, 1, 1 },
 						hint = "The Deathspeaker's bony leg in place of yours",
 					}),
 				},
@@ -2903,6 +2945,8 @@ do
 						if item.profile and not item.firstIsOff then
 							item.default = item.profile[Settings.profile]
 						end
+						item.maxLoad = math.max(table.unpack(item.loads))
+					elseif item.loads then
 						item.maxLoad = math.max(table.unpack(item.loads))
 					else
 						item.maxLoad = item.load or 0
@@ -3111,8 +3155,12 @@ end
 -- `id` is a setting id, or one of the pseudo ids "@enabled",
 -- "@governor" and "@all" for state that is not a schema item.
 function Settings.notify(id)
+	-- One broken listener must not stop the others (or the save below).
 	for _, listener in Settings.listeners do
-		listener(id)
+		local ok, message = pcall(listener, id)
+		if not ok then
+			warn("[Solstice] settings listener failed: " .. tostring(message))
+		end
 	end
 	if id ~= "@governor" then
 		Settings.save()
@@ -3182,10 +3230,19 @@ function Settings.itemLoad(item)
 	local value = Settings.values[item.id]
 	if item.kind == "tier" then
 		return item.loads[Settings.tier(item.id)]
+	elseif item.kind == "choice" and item.loads then
+		return item.loads[value] or 0
 	elseif item.kind == "toggle" then
 		return value and item.load or 0
 	elseif item.kind == "slider" then
-		return value > item.min and item.load or 0
+		if value <= item.min then
+			return 0
+		end
+		-- A scaled cost grows with the slider (detail, range, intensity).
+		if item.scaled then
+			return math.max(1, math.ceil(item.load * (value - item.min) / (item.max - item.min) - 0.001))
+		end
+		return item.load
 	end
 	return 0
 end
@@ -3936,31 +3993,46 @@ end
 -- best map `samples` onto their mixed colours. A light pull towards "no
 -- change" keeps a handful of samples from producing wild tints.
 function Mixer.fit(samples, strength)
-	local nr, ng, nb = 0.05, 0.05, 0.05
-	local dr, dg, db = 0.05, 0.05, 0.05
-	local saturation, counted = 0, 0
+	-- A global layer is spread over every pixel, so a change to one colour
+	-- gets diluted by the rest of the screen. Two things push back: samples
+	-- weigh in by how much the mix moves them (the colours you changed lead
+	-- the fit, the ones you didn't hardly hold it back), and the result is
+	-- driven harder than the plain fit, so 1x reads clearly and 2x is as
+	-- bold as an editor's sliders.
+	local gain = strength * 2.4
+	local nr, ng, nb = 0.02, 0.02, 0.02
+	local dr, dg, db = 0.02, 0.02, 0.02
+	local saturation, light, total = 0, 0, 0
 	for _, x in samples do
 		local y = Mixer.mix(x)
-		nr += x.R * y.R
-		ng += x.G * y.G
-		nb += x.B * y.B
-		dr += x.R * x.R
-		dg += x.G * x.G
-		db += x.B * x.B
+		local change = math.abs(y.R - x.R) + math.abs(y.G - x.G) + math.abs(y.B - x.B)
+		local weight = 0.15 + change * 6
+		nr += weight * x.R * y.R
+		ng += weight * x.G * y.G
+		nb += weight * x.B * y.B
+		dr += weight * x.R * x.R
+		dg += weight * x.G * x.G
+		db += weight * x.B * x.B
 		local _, sx = x:ToHSV()
 		local _, sy = y:ToHSV()
-		saturation += sy - sx
-		counted += 1
+		saturation += weight * (sy - sx)
+		light += weight * (luminance(y) - luminance(x))
+		total += weight
 	end
-	local r = 1 + (nr / dr - 1) * strength
-	local g = 1 + (ng / dg - 1) * strength
-	local b = 1 + (nb / db - 1) * strength
+	local r = math.max(1 + (nr / dr - 1) * gain, 0.05)
+	local g = math.max(1 + (ng / dg - 1) * gain, 0.05)
+	local b = math.max(1 + (nb / db - 1) * gain, 0.05)
 	-- TintColor can only darken a channel, so the gains are normalised to the
-	-- strongest one; the brightness lost is returned so it can be put back.
+	-- strongest one; the brightness lost is returned so it can be put back,
+	-- along with the brightness the mix itself adds or takes away.
 	local top = math.max(r, g, b, 1)
-	local tint = Color3.new(math.max(r, 0) / top, math.max(g, 0) / top, math.max(b, 0) / top)
-	local lift = luminance(Color3.new(math.max(r, 0), math.max(g, 0), math.max(b, 0))) - luminance(tint)
-	local shift = counted > 0 and saturation / counted * strength or 0
+	local tint = Color3.new(r / top, g / top, b / top)
+	local lift = luminance(Color3.new(math.min(r, 2), math.min(g, 2), math.min(b, 2))) - luminance(tint)
+	local shift = 0
+	if total > 0 then
+		shift = saturation / total * gain
+		lift += light / total * gain
+	end
 	return tint, shift, lift
 end
 -- Slow-moving simulation state. Everything in here is smoothed, so abrupt
@@ -4908,8 +4980,6 @@ do
 	local PUDDLE_COUNT = { 0, 10, 20, 36 }
 	local PUDDLE_RANGE = 75
 	local PUDDLE_COLOR = rgb(44, 50, 56)
-	-- Cylinders are round along X; this stands them on end so they lie flat.
-	local FLAT = CFrame.Angles(0, 0, math.pi / 2)
 	-- Ground a puddle never forms on.
 	local DRY_GROUND = {
 		[Enum.Material.Water] = true,
@@ -5203,16 +5273,46 @@ do
 	-- Puddles. Complementary-style rain puddles: while surfaces are wet, flat
 	-- open ground near the player gathers pools of reflective water that
 	-- spread as the rain goes on, ripple under the drops, and shrink away as
-	-- things dry. Each puddle is two or three overlapping glassy discs (for an
-	-- irregular outline) plus a flat ripple emitter. Spots are found with a
+	-- things dry. Each puddle is a small, rounded, irregular polygon (a fan
+	-- of flat triangles, each drawn with two thin wedges) plus a flat ripple
+	-- emitter. Spots are found with a
 	-- downward ray (flat, not sand or snow) and an upward ray (open to the
 	-- sky), one candidate every 0.15 seconds, so the cost is a trickle.
 	----------------------------------------------------------------------------
 
+	local PUDDLE_SIDES = 8
+
+	-- A flat triangle a, b, c from two wedges (the usual Roblox technique:
+	-- split it at the foot of the height on its longest side).
+	local function drawTriangle(w1, w2, a, b, c)
+		local ab, ac, bc = b - a, c - a, c - b
+		local abd, acd, bcd = ab:Dot(ab), ac:Dot(ac), bc:Dot(bc)
+		if abd > acd and abd > bcd then
+			c, a = a, c
+		elseif acd > bcd and acd > abd then
+			a, b = b, a
+		end
+		ab, ac, bc = b - a, c - a, c - b
+		local normal = ac:Cross(ab)
+		if normal.Magnitude < 1e-6 or bc.Magnitude < 1e-6 then
+			w1.Transparency, w2.Transparency = 1, 1
+			return false
+		end
+		local right = normal.Unit
+		local up = bc:Cross(right).Unit
+		local back = bc.Unit
+		local height = math.abs(ab:Dot(up))
+		w1.Size = Vector3.new(0.05, height, math.abs(ab:Dot(back)))
+		w1.CFrame = CFrame.fromMatrix((a + b) / 2, right, up, back)
+		w2.Size = Vector3.new(0.05, height, math.abs(ac:Dot(back)))
+		w2.CFrame = CFrame.fromMatrix((a + c) / 2, -right, up, -back)
+		return true
+	end
+
 	local function makePuddle()
 		local blobs = {}
-		for index = 1, 3 do
-			blobs[index] = create("Part", {
+		for index = 1, PUDDLE_SIDES * 2 do
+			blobs[index] = create("WedgePart", {
 				Name = "Puddle",
 				Anchored = true,
 				CanCollide = false,
@@ -5220,14 +5320,13 @@ do
 				CanTouch = false,
 				CastShadow = false,
 				Locked = true,
-				Shape = Enum.PartType.Cylinder,
 				-- Smooth, dark and reflective reads as standing water from any
 				-- angle; Glass all but vanishes when seen at a low angle.
 				Material = Enum.Material.SmoothPlastic,
 				Color = PUDDLE_COLOR,
 				Reflectance = 0.6,
 				Transparency = 1,
-				Size = Vector3.new(0.08, 1, 1),
+				Size = Vector3.new(0.05, 1, 1),
 				Parent = World.folder,
 			})
 		end
@@ -5300,15 +5399,23 @@ do
 		puddle.seated = true
 		puddle.position = position
 		puddle.color = color
-		puddle.size = between(3, 8.5) * get("world.puddleSize")
+		puddle.size = between(1.6, 4.4) * get("world.puddleSize")
 		puddle.presence = 0
 		puddle.applied = -1
-		for index = 1, #puddle.blobs do
-			local offset = Vector3.zero
-			if index > 1 then
-				offset = Vector3.new(between(-0.35, 0.35), 0, between(-0.35, 0.35)) * puddle.size
-			end
-			puddle.shape[index] = { offset = offset, scale = index == 1 and 1 or between(0.45, 0.8) }
+		-- The outline: corners round the centre at slightly uneven angles and
+		-- distances, smoothed so it stays rounded rather than spiky.
+		local turn = math.random() * math.pi * 2
+		local radii = {}
+		for index = 1, PUDDLE_SIDES do
+			radii[index] = between(0.72, 1.12)
+		end
+		table.clear(puddle.shape)
+		for index = 1, PUDDLE_SIDES do
+			local before = radii[(index - 2) % PUDDLE_SIDES + 1]
+			local after = radii[index % PUDDLE_SIDES + 1]
+			local radius = (before + radii[index] * 2 + after) / 4
+			local angle = turn + (index - 1 + between(-0.25, 0.25)) / PUDDLE_SIDES * math.pi * 2
+			puddle.shape[index] = Vector3.new(math.cos(angle) * radius, 0, math.sin(angle) * radius)
 		end
 		puddle.host.CFrame = CFrame.new(position + Vector3.new(0, 0.08, 0))
 		puddle.host.Size = Vector3.new(puddle.size * 0.7, 0.1, puddle.size * 0.7)
@@ -5325,18 +5432,20 @@ do
 		if math.abs(presence - puddle.applied) > 0.015 or (presence < 0.01 and puddle.applied >= 0.01) then
 			puddle.applied = presence
 			-- Puddles spread as they fill and shrink as they dry.
-			local grow = 0.35 + 0.65 * presence
-			for index, blob in puddle.blobs do
-				local shape = puddle.shape[index]
-				if presence < 0.01 or not shape then
-					blob.Transparency = 1
-				else
-					local diameter = puddle.size * shape.scale * grow
-					blob.Size = Vector3.new(0.08, diameter, diameter)
-					blob.CFrame = CFrame.new(puddle.position + shape.offset * grow + Vector3.new(0, 0.04 + index * 0.006, 0)) * FLAT
-					blob.Transparency = lerp(1, 0.12, presence)
-					blob.Color = puddle.color
-					blob.Reflectance = shine
+			local radius = puddle.size / 2 * (0.35 + 0.65 * presence)
+			local centre = puddle.position + Vector3.new(0, 0.045, 0)
+			for side = 1, PUDDLE_SIDES do
+				local w1, w2 = puddle.blobs[side * 2 - 1], puddle.blobs[side * 2]
+				local a = puddle.shape[side]
+				local b = puddle.shape[side % PUDDLE_SIDES + 1]
+				if presence < 0.01 or not a or not b then
+					w1.Transparency, w2.Transparency = 1, 1
+				elseif drawTriangle(w1, w2, centre, centre + a * radius, centre + b * radius) then
+					for _, wedge in { w1, w2 } do
+						wedge.Transparency = lerp(1, 0.12, presence)
+						wedge.Color = puddle.color
+						wedge.Reflectance = shine
+					end
 				end
 			end
 		end
@@ -7139,7 +7248,7 @@ local Mirrors: { [string]: any } = {
 
 do
 	local MAX_PUDDLES = 3
-	local MAX_WALLS = 2
+	local MAX_FLOORS = 2
 	local MAX_CHARACTERS = 6
 	local CHROME_AVATARS = 3
 	local CHROME_PARTS = 8
@@ -7149,7 +7258,7 @@ do
 	local WIDEST = math.rad(116)
 	local MAX_FRAME = 4096
 	local MAX_CANVAS = 1024
-	local PPX = { puddle = 20, floor = 6, wall = 10, chrome = 36 }
+	local PPX = { puddle = 20, floor = 6, chrome = 36 }
 	local REF = "SolsticeMirrorRef"
 
 	-- How glossy a floor is by material: glass and polished stone mirror
@@ -7234,7 +7343,25 @@ do
 		return instance:IsA("FaceInstance") or instance:IsA("DataModelMesh") or instance:IsA("SurfaceAppearance")
 	end
 
-	local function copyPart(part)
+	-- A far structure is drawn as a plain block of its size and colour: at a
+	-- distance the difference does not show, and it costs a fraction.
+	local function simpleCopy(part)
+		local copy = Instance.new("Part")
+		copy.Size = part.Size
+		copy.Color = part.Color
+		copy.Material = part.Material
+		copy.Transparency = part.Transparency
+		if part:IsA("Part") then
+			copy.Shape = part.Shape
+		end
+		settle(copy)
+		return copy
+	end
+
+	local function copyPart(part, simple)
+		if simple then
+			return simpleCopy(part)
+		end
 		local archivable = part.Archivable
 		part.Archivable = true
 		local ok, copy = pcall(part.Clone, part)
@@ -7351,6 +7478,19 @@ do
 			})
 		end
 		local view = create("ViewportFrame", { BackgroundTransparency = 1, Parent = clip })
+		-- Distortion's ripples: a soft tiled sheen drifting over the image.
+		local ripple = create("ImageLabel", {
+			Name = "Ripple",
+			Size = UDim2.new(1, 256, 1, 256),
+			Position = UDim2.fromOffset(-128, -128),
+			BackgroundTransparency = 1,
+			Image = CONFIG.ParticleTexture,
+			ScaleType = Enum.ScaleType.Tile,
+			TileSize = UDim2.fromOffset(96, 48),
+			ImageTransparency = 1,
+			ZIndex = 2,
+			Parent = clip,
+		})
 		local camera = Instance.new("Camera")
 		camera.Parent = view
 		view.CurrentCamera = camera
@@ -7360,6 +7500,7 @@ do
 			host = host,
 			gui = gui,
 			view = view,
+			ripple = ripple,
 			camera = camera,
 			model = model,
 			avatars = {}, -- character -> copy
@@ -7466,13 +7607,27 @@ do
 			fov = WIDEST
 			halfY = math.tan(fov / 2) * scale * d
 		end
-		local wobble = distortion * scale * 0.35
-		local ox = math.noise(time * 0.7, surface.seed) * wobble
-		local oy = math.noise(time * 0.6, surface.seed + 7) * wobble
+		-- Distortion: the image sways (the frame drifts, at two speeds), the
+		-- lens tilts a little so straight lines bend and breathe, and a soft
+		-- ripple sheen drifts across it, like a surface that is not quite
+		-- still.
+		local seed = surface.seed
+		local wobble = distortion * scale * 1.1
+		local ox = (math.noise(time * 0.9, seed) + 0.4 * math.noise(time * 3.1, seed + 3)) * wobble
+		local oy = (math.noise(time * 0.8, seed + 7) + 0.4 * math.noise(time * 2.7, seed + 11)) * wobble
+		local tilt = distortion * 0.05
 		surface.view.Size = UDim2.fromOffset(halfX * 2, halfY * 2)
 		surface.view.Position = UDim2.fromOffset(fx - halfX + ox, fy - halfY + oy)
-		surface.camera.FieldOfView = math.deg(fov)
+		surface.camera.FieldOfView = math.deg(fov) * (1 + distortion * 0.03 * math.noise(time * 0.5, seed + 19))
 		surface.camera.CFrame = CFrame.lookAt(eye, eye - n, U)
+			* CFrame.Angles(math.noise(time * 0.7, seed + 23) * tilt, math.noise(time * 0.6, seed + 29) * tilt, 0)
+		local ripple = surface.ripple
+		if distortion > 0.01 then
+			ripple.ImageTransparency = 1 - 0.22 * distortion
+			ripple.Position = UDim2.fromOffset(-128 + (time * 23) % 96, -128 + (time * 9) % 48)
+		elseif ripple.ImageTransparency < 1 then
+			ripple.ImageTransparency = 1
+		end
 		return true
 	end
 	Mirrors.place = place
@@ -7497,16 +7652,24 @@ do
 		surface.planeKey = key
 		for part, entry in wanted do
 			local record = parts[part]
+			-- Moved nearer or further: copy it again at the new detail.
+			if record and record.simple ~= entry.simple and Mirrors.budget > 0 then
+				if record.copy then
+					record.copy:Destroy()
+				end
+				parts[part] = nil
+				record = nil
+			end
 			if not record then
 				if Mirrors.budget <= 0 then
 					continue
 				end
 				Mirrors.budget -= 1
-				local copy = copyPart(part)
+				local copy = copyPart(part, entry.simple)
 				if copy then
 					copy.Parent = surface.model
 				end
-				record = { copy = copy, version = -1 }
+				record = { copy = copy, version = -1, simple = entry.simple }
 				parts[part] = record
 			end
 			local copy = record.copy
@@ -7636,17 +7799,25 @@ do
 		return value * get("mat.floorGloss")
 	end
 
-	-- The structures worth reflecting: big and close first.
-	local function selectWorld(eye, radius, budget)
+	-- The structures worth reflecting, by level of detail: a part is kept
+	-- while it looks big enough from here (its size against its distance),
+	-- so small things drop out first as they get further away, and only the
+	-- near ones are copied in full (meshes, decals); further ones are plain
+	-- blocks. "Reflection detail" moves every one of those thresholds.
+	local function selectWorld(eye, radius, detail)
 		overlap.FilterDescendantsInstances = Mirrors.ignore
+		local smallest = lerp(0.14, 0.012, detail) -- size / distance to be kept
+		local near = lerp(18, 120, detail) -- copied in full within this
+		local cap = math.floor(lerp(90, 900, detail))
 		local candidates = {}
 		for _, part in Workspace:GetPartBoundsInRadius(eye, radius, overlap) do
 			if part ~= Fx.terrain and part.Transparency < 0.95 and not part:GetAttribute(OWNED_ATTRIBUTE) then
 				local size = part.Size
 				local extent = math.max(size.X, size.Y, size.Z)
-				if extent >= 0.75 then
-					local gap = math.max((part.Position - eye).Magnitude - extent * 0.5, 1)
-					table.insert(candidates, { part = part, score = extent / gap })
+				local gap = math.max((part.Position - eye).Magnitude - extent * 0.5, 1)
+				local score = extent / gap
+				if score >= smallest then
+					table.insert(candidates, { part = part, score = score, gap = gap })
 				end
 			end
 		end
@@ -7654,10 +7825,12 @@ do
 			return a.score > b.score
 		end)
 		local world, list = {}, {}
-		for index = 1, math.min(#candidates, budget) do
-			local part = candidates[index].part
+		for index = 1, math.min(#candidates, cap) do
+			local candidate = candidates[index]
+			local part = candidate.part
 			local entry = Mirrors.world[part]
 				or { part = part, cframe = part.CFrame, transparency = part.Transparency, version = 0 }
+			entry.simple = candidate.gap > near
 			world[part] = entry
 			list[index] = entry
 		end
@@ -7681,42 +7854,132 @@ do
 		end
 	end
 
-	-- A window on a big floor: from just behind your feet to far ahead along
-	-- the view, as wide as one lens can see across, shrunk until it lies on
-	-- the floor's face.
-	local function floorWindow(face, eye)
-		local n = face.n
-		local d = (eye - face.c):Dot(n)
+	-- Floors. Rays fall straight down from a fan of points around and ahead
+	-- of you (starting from your character, so jumping changes nothing) and
+	-- the glossy horizontal surfaces they land on are grouped by height: a
+	-- tiled floor of many parts is one floor. The best groups (most hits,
+	-- glossiest) become the reflecting floors, each spanning the bounds of
+	-- the parts that make it up.
+	local FAN = {
+		{ 0, 0 },
+		{ -6, 0 },
+		{ 6, 0 },
+		{ 14, 0 },
+		{ 26, 0 },
+		{ 45, 0 },
+		{ 70, 0 },
+		{ 10, -12 },
+		{ 10, 12 },
+		{ 26, -22 },
+		{ 26, 22 },
+		{ 45, -30 },
+		{ 45, 30 },
+		{ 0, -10 },
+		{ 0, 10 },
+	}
+
+	local function topBounds(part, bounds)
+		local cf, size = part.CFrame, part.Size / 2
+		for _, x in { -1, 1 } do
+			for _, z in { -1, 1 } do
+				for _, y in { -1, 1 } do
+					local corner = cf * Vector3.new(size.X * x, size.Y * y, size.Z * z)
+					bounds.minX = math.min(bounds.minX, corner.X)
+					bounds.maxX = math.max(bounds.maxX, corner.X)
+					bounds.minZ = math.min(bounds.minZ, corner.Z)
+					bounds.maxZ = math.max(bounds.maxZ, corner.Z)
+				end
+			end
+		end
+	end
+
+	local function findFloors(eye)
+		local own = localPlayer.Character
+		local root = own and own:FindFirstChild("HumanoidRootPart")
+		local base = root and root.Position or eye
+		local look = Vector3.new(F.look.X, 0, F.look.Z)
+		look = look.Magnitude > 0.05 and look.Unit or Vector3.zAxis
+		local across = look:Cross(Vector3.yAxis)
+		local groups = {}
+		for index, point in FAN do
+			local origin = base + look * point[1] + across * point[2] + Vector3.new(0, 4, 0)
+			local hit = Workspace:Raycast(origin, Vector3.new(0, -90, 0), rays)
+			local part = hit and hit.Instance
+			if part and part ~= Fx.terrain and part:IsA("BasePart") and hit.Normal.Y > 0.95 then
+				local glossiness = gloss(part)
+				if glossiness > 0.02 then
+					local key = math.floor(hit.Position.Y * 5 + 0.5)
+					local group = groups[key]
+					if not group then
+						group = {
+							y = hit.Position.Y,
+							parts = {},
+							gloss = 0,
+							weight = 0,
+							bounds = { minX = math.huge, maxX = -math.huge, minZ = math.huge, maxZ = -math.huge },
+						}
+						groups[key] = group
+					end
+					if not group.parts[part] then
+						group.parts[part] = true
+						topBounds(part, group.bounds)
+					end
+					group.gloss = math.max(group.gloss, glossiness)
+					-- The floor under you counts most.
+					group.weight += index == 1 and 4 or 1
+				end
+			end
+		end
+		local list = {}
+		for _, group in groups do
+			table.insert(list, group)
+		end
+		table.sort(list, function(a, b)
+			return a.weight * a.gloss > b.weight * b.gloss
+		end)
+		local floors = {}
+		for index = 1, math.min(#list, MAX_FLOORS) do
+			floors[index] = list[index]
+		end
+		Mirrors.floors = floors
+	end
+
+	-- The window a floor reflects in: from just behind your feet to far
+	-- ahead along the view, as wide as the lens can see across, cut down to
+	-- the floor's bounds. It is aligned with the world's axes (the one
+	-- nearest the view runs ahead), so cutting it to the bounds always
+	-- leaves a rectangle, wherever you stand or however high you jump.
+	local function floorWindow(floor, eye)
+		local d = eye.Y - floor.y
 		if d < 0.25 then
 			return nil
 		end
-		local look = F.look - n * F.look:Dot(n)
-		local R = look.Magnitude > 0.05 and look.Unit or face.a[1]
-		local U = (-n):Cross(R)
-		local foot = eye - n * d
-		local side = d * math.tan(WIDEST / 2)
-		local back, ahead = math.min(side, 20), FLOOR_LENGTH
-		local function inside(point)
-			local offset = point - face.c
-			return math.abs(offset:Dot(face.a[1])) <= face.a[2] / 2 + 0.01
-				and math.abs(offset:Dot(face.b[1])) <= face.b[2] / 2 + 0.01
+		local bounds = floor.bounds
+		local alongX = math.abs(F.look.X) >= math.abs(F.look.Z)
+		local sign = alongX and (F.look.X >= 0 and 1 or -1) or (F.look.Z >= 0 and 1 or -1)
+		local side = math.min(d * math.tan(WIDEST / 2), FLOOR_LENGTH)
+		local back = math.min(side, 20)
+		local footA = alongX and eye.X or eye.Z
+		local footB = alongX and eye.Z or eye.X
+		local lowA = math.min(footA - sign * back, footA + sign * FLOOR_LENGTH)
+		local highA = math.max(footA - sign * back, footA + sign * FLOOR_LENGTH)
+		local minA = math.max(lowA, alongX and bounds.minX or bounds.minZ)
+		local maxA = math.min(highA, alongX and bounds.maxX or bounds.maxZ)
+		local minB = math.max(footB - side, alongX and bounds.minZ or bounds.minX)
+		local maxB = math.min(footB + side, alongX and bounds.maxZ or bounds.maxX)
+		if maxA - minA < 1 or maxB - minB < 1 then
+			return nil
 		end
-		for _ = 1, 10 do
-			local centre = foot + R * ((ahead - back) / 2)
-			local length = (ahead + back) / 2
-			if
-				inside(centre + R * length + U * side)
-				and inside(centre + R * length - U * side)
-				and inside(centre - R * length + U * side)
-				and inside(centre - R * length - U * side)
-			then
-				return { c = centre, n = n, U = U, w = ahead + back, h = side * 2 }
-			end
-			ahead *= 0.7
-			back *= 0.7
-			side *= 0.85
-		end
-		return nil
+		local a, b = (minA + maxA) / 2, (minB + maxB) / 2
+		local centre = alongX and Vector3.new(a, floor.y, b) or Vector3.new(b, floor.y, a)
+		-- U runs across the view (the lens-limited direction).
+		return {
+			c = centre,
+			n = Vector3.yAxis,
+			U = alongX and Vector3.zAxis or Vector3.xAxis,
+			w = maxA - minA,
+			h = maxB - minB,
+		}
 	end
 
 	function Mirrors.update(dt)
@@ -7764,7 +8027,7 @@ do
 		-- What is reflected: the structures around you.
 		local fullScan = every("mirrorWorld", 2, dt)
 		if fullScan then
-			selectWorld(eye, range, math.floor(get("mat.mirrorDetail")))
+			selectWorld(eye, range, get("mat.mirrorLod"))
 		end
 		trackWorld(fullScan)
 		local list = Mirrors.worldList
@@ -7782,7 +8045,8 @@ do
 			end)
 			for index = 1, math.min(#candidates, MAX_PUDDLES) do
 				local puddle = candidates[index]
-				local diameter = puddle.size * (0.35 + 0.65 * puddle.presence)
+				-- Inside the polygon's rounded outline.
+				local diameter = puddle.size * (0.35 + 0.65 * puddle.presence) * 0.7
 				local centre = puddle.position + Vector3.new(0, 0.095, 0)
 				-- The long reach runs from your feet towards the puddle.
 				local toward = Vector3.new(centre.X - eye.X, 0, centre.Z - eye.Z)
@@ -7793,57 +8057,15 @@ do
 		end
 
 		if tier >= 3 then
-			-- Floors: whatever you stand on (or the camera is above), as
-			-- glossy as its material, its Reflectance and the rain make it.
-			if every("mirrorFloor", 0.25, dt) then
-				local origin = eye
-				local own = localPlayer.Character
-				local root = own and own:FindFirstChild("HumanoidRootPart")
-				if root then
-					origin = root.Position
-				end
-				local hit = Workspace:Raycast(origin, Vector3.new(0, -60, 0), rays)
-				local part = hit and hit.Instance
-				Mirrors.floorPart = (part and part ~= Fx.terrain and part:IsA("BasePart")) and part or nil
+			-- Floors: the glossy surfaces around and ahead of you, as glossy
+			-- as their material, their Reflectance and the rain make them.
+			if every("mirrorFloor", 0.3, dt) then
+				findFloors(eye)
 			end
-			local part = Mirrors.floorPart
-			local glossiness = part and part.Parent and gloss(part) or 0
-			local face = glossiness > 0.02 and faceOf(part, eye, true) or nil
-			local plane = face and (floorWindow(face, eye) or facePlane(face, eye))
-			if plane then
-				show("floor", "floor", plane, eye, strength * math.min(glossiness, 1), tint, list, nil)
-			end
-		end
-
-		if tier >= 4 then
-			-- Mirrors and glass: very reflective parts facing you.
-			if every("mirrorWalls", 1, dt) then
-				overlap.FilterDescendantsInstances = Mirrors.ignore
-				local found = {}
-				for _, part in Workspace:GetPartBoundsInRadius(eye, 80, overlap) do
-					local mirrorLike = part.Reflectance >= 0.35
-						or part.Material == Enum.Material.Foil
-						or (part.Material == Enum.Material.Glass and part.Transparency < 0.7)
-					if mirrorLike and part.Transparency < 0.95 and part ~= Mirrors.floorPart then
-						table.insert(found, { part = part, distance = (part.Position - eye).Magnitude })
-					end
-				end
-				table.sort(found, function(a, b)
-					return a.distance < b.distance
-				end)
-				Mirrors.wallParts = found
-			end
-			local used = 0
-			for _, entry in Mirrors.wallParts or {} do
-				if used >= MAX_WALLS then
-					break
-				end
-				local part = entry.part
-				local face = part.Parent and faceOf(part, eye, false)
-				if face and face.a[2] * face.b[2] >= 2 then
-					used += 1
-					local opacity = strength * (part.Material == Enum.Material.Glass and 0.5 or 1)
-					show("wall" .. used, "wall", facePlane(face, eye), eye, opacity, tint, list, nil)
+			for index, floor in Mirrors.floors or {} do
+				local plane = floorWindow(floor, eye)
+				if plane then
+					show("floor" .. index, "floor", plane, eye, strength * math.min(floor.gloss, 1), tint, list, nil)
 				end
 			end
 		end
@@ -7919,18 +8141,43 @@ local Avatars: { [string]: any } = {
 	records = {}, -- part -> { property -> original value }
 	shells = {}, -- original part -> shell copy
 	highlights = {}, -- character -> Highlight
-	legs = {}, -- character -> { side -> { part, follow, offset } }
+	legs = {}, -- character -> { key, pieces = { { part, follow, offset } } }
 	clock = 0,
 }
 
 do
 	local SHELL_GROW = 0.04
-	-- The Korblox Deathspeaker leg: the upper-leg mesh carries the whole leg.
-	local KORBLOX_MESH = "rbxassetid://902942096"
-	local KORBLOX_TEXTURE = "rbxassetid://902843398"
-	local KORBLOX_COLOR = rgb(40, 40, 46)
+	-- The Korblox Deathspeaker legs, from the official body-part assets
+	-- (Left Leg 139607673, Right Leg 139607718): the bony right leg and the
+	-- armoured left one, each with its own meshes and texture. For R15, one
+	-- mesh per segment with its size and where its top joint sits (the
+	-- hip, knee or ankle attachment), so each piece hangs from the same
+	-- joint as the player's own; for R6, the CharacterMesh of the whole leg.
+	-- A LocalScript cannot change a MeshPart's MeshId, so the leg is drawn
+	-- by parts of Solstice's own that follow the real leg, which is hidden.
+	local KORBLOX = {
+		Right = {
+			texture = "rbxassetid://902843398",
+			r6 = "rbxassetid://101851696",
+			r6Texture = "rbxassetid://101851254",
+			segments = {
+				{ part = "UpperLeg", joint = "Hip", mesh = "rbxassetid://9598310133", size = Vector3.new(0.314, 0.862, 0.391), top = Vector3.new(0.019, 0.242, 0.03) },
+				{ part = "LowerLeg", joint = "Knee", mesh = "rbxassetid://9598310138", size = Vector3.new(0.35, 0.597, 0.299), top = Vector3.new(0.01, 0.265, -0.067) },
+				{ part = "Foot", joint = "Ankle", mesh = "rbxassetid://9598310128", size = Vector3.new(0.264, 0.264, 0.264), top = Vector3.zero },
+			},
+		},
+		Left = {
+			texture = "rbxassetid://902842271",
+			r6 = "rbxassetid://101851582",
+			r6Texture = "rbxassetid://101851254",
+			segments = {
+				{ part = "UpperLeg", joint = "Hip", mesh = "rbxassetid://9598310131", size = Vector3.new(0.46, 1.215, 0.39), top = Vector3.new(0.054, 0.418, 0.089) },
+				{ part = "LowerLeg", joint = "Knee", mesh = "rbxassetid://9598310137", size = Vector3.new(0.35, 0.597, 0.299), top = Vector3.new(-0.011, 0.265, -0.067) },
+				{ part = "Foot", joint = "Ankle", mesh = "rbxassetid://9598310118", size = Vector3.new(0.264, 0.264, 0.264), top = Vector3.zero },
+			},
+		},
+	}
 	local MATERIALS = { false, "Neon", "Glass", "Foil", "ForceField", "Ice", "Marble", "SmoothPlastic" }
-	local korbloxLoaded = nil -- nil: unknown, true / false once the mesh has loaded or failed
 
 	local function record(part, property)
 		local entry = Avatars.records[part]
@@ -8033,51 +8280,73 @@ do
 		end
 	end
 
-	-- A Korblox leg in place of one of the character's legs.
+	-- The real leg parts on one side: R15's three, or R6's one.
 	local function legParts(character, side)
-		local r15 = character:FindFirstChild(side .. "UpperLeg")
-		if r15 then
-			return r15, { r15, character:FindFirstChild(side .. "LowerLeg"), character:FindFirstChild(side .. "Foot") }
+		local list = {}
+		for _, name in { "UpperLeg", "LowerLeg", "Foot" } do
+			local part = character:FindFirstChild(side .. name)
+			if part and part:IsA("BasePart") then
+				table.insert(list, part)
+			end
 		end
-		local r6 = character:FindFirstChild(side .. " Leg")
-		if r6 then
-			return r6, { r6 }
+		if #list == 0 then
+			local r6 = character:FindFirstChild(side .. " Leg")
+			if r6 and r6:IsA("BasePart") then
+				table.insert(list, r6)
+			end
 		end
-		return nil, {}
+		return list
 	end
 
-	local function makeLeg(follow, mirrored)
-		local part = hiddenPart("KorbloxLeg", Vector3.new(1, 2, 1), nil)
+	local function legPiece(follow, mesh, texture, size, scale, offset)
+		local part = hiddenPart("KorbloxLeg", size * scale, nil)
 		part.Transparency = 0
-		part.Color = KORBLOX_COLOR
-		part.Material = Enum.Material.SmoothPlastic
-		if korbloxLoaded ~= false then
-			create("SpecialMesh", {
-				MeshType = Enum.MeshType.FileMesh,
-				MeshId = KORBLOX_MESH,
-				TextureId = KORBLOX_TEXTURE,
-				Scale = Vector3.new(mirrored and -1 or 1, 1, 1),
-				Parent = part,
-			})
-		else
-			-- The mesh could not load: a thin bony leg of plain parts.
-			part.Size = Vector3.new(0.3, 2, 0.3)
-			part.Shape = Enum.PartType.Cylinder
-		end
+		part.CastShadow = true
+		create("SpecialMesh", {
+			MeshType = Enum.MeshType.FileMesh,
+			MeshId = mesh,
+			TextureId = texture,
+			Scale = scale,
+			Parent = part,
+		})
 		part.Parent = Fx.world
-		-- R6 legs are one 2-stud part; the R15 mesh sits on the upper leg.
-		local offset = follow.Name:find("UpperLeg") and CFrame.new() or CFrame.new(0, 0.42, 0)
-		if korbloxLoaded == false then
-			offset = CFrame.new(0, follow.Name:find("UpperLeg") and -0.6 or 0, 0) * CFrame.Angles(0, 0, math.pi / 2)
-		end
 		return { part = part, follow = follow, offset = offset }
+	end
+
+	-- Build the Korblox pieces for one side of a character.
+	local function makeLeg(character, side, pieces)
+		local spec = KORBLOX[side]
+		local humanoid = character:FindFirstChildOfClass("Humanoid")
+		if humanoid and humanoid.RigType == Enum.HumanoidRigType.R6 then
+			local leg = character:FindFirstChild(side .. " Leg")
+			if leg and leg:IsA("BasePart") then
+				table.insert(pieces, legPiece(leg, spec.r6, spec.r6Texture, Vector3.new(1, 2, 1), Vector3.one, CFrame.new()))
+			end
+			return
+		end
+		-- The avatar's body scale, so the leg matches the rest of it.
+		local function scaleValue(name)
+			local value = humanoid and humanoid:FindFirstChild(name)
+			return value and value:IsA("NumberValue") and value.Value or 1
+		end
+		local scale = Vector3.new(scaleValue("BodyWidthScale"), scaleValue("BodyHeightScale"), scaleValue("BodyDepthScale"))
+		for _, segment in spec.segments do
+			local follow = character:FindFirstChild(side .. segment.part)
+			if follow and follow:IsA("BasePart") then
+				-- Hang the piece from the same joint as the player's segment.
+				local joint = follow:FindFirstChild(side .. segment.joint .. "RigAttachment")
+				local anchor = joint and joint:IsA("Attachment") and joint.Position or Vector3.zero
+				local offset = CFrame.new(anchor - segment.top * scale)
+				table.insert(pieces, legPiece(follow, segment.mesh, spec.texture, segment.size, scale, offset))
+			end
+		end
 	end
 
 	local function dropLegs(character)
 		local legs = Avatars.legs[character]
 		if legs then
-			for _, leg in legs do
-				leg.part:Destroy()
+			for _, piece in legs.pieces do
+				piece.part:Destroy()
 			end
 			Avatars.legs[character] = nil
 		end
@@ -8188,27 +8457,29 @@ do
 				table.insert(sides, "Right")
 			end
 			local legs = Avatars.legs[character]
-			local key = table.concat(sides, "+") .. tostring(korbloxLoaded)
+			local key = table.concat(sides, "+")
+			-- A respawned or re-dressed leg: build the pieces again.
+			if legs then
+				for _, piece in legs.pieces do
+					if piece.follow.Parent ~= character then
+						key = ""
+					end
+				end
+			end
 			if legs and legs.key ~= key then
 				dropLegs(character)
 				legs = nil
 			end
 			if #sides > 0 and not legs then
-				legs = { key = key }
+				legs = { key = key, pieces = {} }
 				for _, side in sides do
-					local follow = legParts(character, side)
-					if follow then
-						table.insert(legs, makeLeg(follow, side == "Left"))
-					end
+					makeLeg(character, side, legs.pieces)
 				end
 				Avatars.legs[character] = legs
 			end
 			for _, side in sides do
-				local _, hide = legParts(character, side)
-				for _, part in hide do
-					if part then
-						want(part, "Transparency", 1)
-					end
+				for _, part in legParts(character, side) do
+					want(part, "Transparency", 1)
 				end
 			end
 			-- Colour cycle.
@@ -8248,24 +8519,6 @@ do
 		end
 	end
 
-	-- Ask once whether the Korblox mesh is reachable.
-	local function probeKorblox()
-		if korbloxLoaded ~= nil or Avatars.probing then
-			return
-		end
-		Avatars.probing = true
-		task.spawn(function()
-			local ok = pcall(function()
-				game:GetService("ContentProvider"):PreloadAsync({ KORBLOX_MESH }, function(_, status)
-					korbloxLoaded = status == Enum.AssetFetchStatus.Success
-				end)
-			end)
-			if not ok or korbloxLoaded == nil then
-				korbloxLoaded = false
-			end
-		end)
-	end
-
 	local moveParts, moveFrames = {}, {}
 
 	function Avatars.update(dt)
@@ -8276,9 +8529,6 @@ do
 			return
 		end
 		Avatars.active = true
-		if get("fun.korblox") > 1 then
-			probeKorblox()
-		end
 		if every("avatarRefresh", 0.5, dt) then
 			refresh()
 		end
@@ -8299,12 +8549,13 @@ do
 			end
 		end
 		for _, legs in Avatars.legs do
-			for _, leg in legs do
-				local follow = leg.follow
+			for _, piece in legs.pieces do
+				local follow = piece.follow
 				if follow.Parent then
-					table.insert(moveParts, leg.part)
-					table.insert(moveFrames, follow.CFrame * leg.offset)
-					put(leg.part, "Transparency", follow.LocalTransparencyModifier, 0.01)
+					table.insert(moveParts, piece.part)
+					table.insert(moveFrames, follow.CFrame * piece.offset)
+					-- First person hides the body; the leg goes with it.
+					put(piece.part, "Transparency", follow.LocalTransparencyModifier, 0.01)
 				end
 			end
 		end
@@ -8784,7 +9035,7 @@ do
 		-- The colour mixer's fitted layer (Stage.mixer).
 		tint = multiplyColor(tint, Mixer.tint)
 		saturation += Mixer.saturation
-		brightness += Mixer.lift * 0.5
+		brightness += Mixer.lift
 
 		if get("fun.hueCycle") then
 			-- Round the rainbow, or along the player's own gradient: wrapping
@@ -9581,44 +9832,231 @@ function Engine.frame(rawDt)
 		end
 	end
 
-	Mixer.update()
-	Stage.mixer(dt)
-	Stage.clock(dt)
-	Stage.sun()
-	Stage.weather(dt)
-	Stage.probes(dt)
-	Stage.water(dt)
-	Stage.sky(dt) -- before lighting: the aurora feeds the ambient glow
-	Stage.lighting(dt)
-	Stage.terrain(dt)
-	Stage.particles(dt)
-	Stage.puddles(dt)
-	Avatars.update(dt)
-	Lights.update(dt)
-	FutureLights.update(dt)
-	Contact.update(dt)
-	Surfaces.update(dt)
-	Paint.update(dt)
-	Stage.post(dt)
-	Stage.camera(dt)
-	-- After the camera, so mirrors aim from where the camera finally is.
-	Mirrors.update(dt)
-	Overlay.update(dt)
+	for _, stage in Engine.stages do
+		Engine.run(stage, dt)
+	end
 end
 
--- A script error inside a render step would otherwise repeat sixty times a
--- second. The first fault is reported; if they keep coming the shaders shut
--- themselves off cleanly instead of flooding the output.
+-- Safeguards. Every feature runs in its own protected call, so an error in
+-- one (a broken avatar, a part the game deleted mid-frame) can never stop
+-- the others or switch the shaders off. A feature that keeps failing is set
+-- aside: it stops running, whatever it changed is put back where possible,
+-- and the player gets a notification naming it, with Retry and Turn off.
+-- Switching the shaders off and on again retries everything.
+local STRIKES = 6 -- errors within STRIKE_WINDOW seconds before a feature is set aside
+local STRIKE_WINDOW = 5
+
+local function off(id, value)
+	return function()
+		Settings.set(id, value)
+	end
+end
+
+-- Each stage of a frame, in order: what the player knows it as, what runs,
+-- how to undo it when it is set aside, and how to switch it off.
+Engine.stages = {
+	{ name = "Colour mixer", run = function(dt)
+		Mixer.update()
+		Stage.mixer(dt)
+	end, turnOff = off("cam.lut", 2) },
+	{ name = "Clock and sun", run = function(dt)
+		Stage.clock(dt)
+		Stage.sun()
+	end },
+	{ name = "Weather", run = function(dt)
+		Stage.weather(dt)
+	end, turnOff = off("world.weather", 1) },
+	{ name = "Shelter detection", run = function(dt)
+		Stage.probes(dt)
+	end },
+	{ name = "Water", run = function(dt)
+		Stage.water(dt)
+	end, turnOff = off("mat.water", 1) },
+	{ name = "Sky", run = function(dt)
+		Stage.sky(dt) -- before lighting: the aurora feeds the ambient glow
+	end, turnOff = off("atmo.aurora", 1) },
+	{ name = "Lighting", run = function(dt)
+		Stage.lighting(dt)
+	end },
+	{ name = "Terrain", run = function(dt)
+		Stage.terrain(dt)
+	end },
+	{ name = "Particles", run = function(dt)
+		Stage.particles(dt)
+	end, turnOff = off("world.motes", 1) },
+	{ name = "Puddles", run = function(dt)
+		Stage.puddles(dt)
+	end, turnOff = off("world.puddles", 1) },
+	{ name = "Avatar effects", run = function(dt)
+		Avatars.update(dt)
+	end, stop = function()
+		Avatars.stop()
+	end, turnOff = function()
+		Settings.set("mat.chrome", 1)
+		Settings.set("fun.avatarCycle", false)
+		Settings.set("fun.avatarReflect", 0)
+		Settings.set("fun.avatarMaterial", 1)
+		Settings.set("fun.avatarGhost", 0)
+		Settings.set("fun.headless", false)
+		Settings.set("fun.korblox", 1)
+	end },
+	{ name = "Lights", run = function(dt)
+		Lights.update(dt)
+	end },
+	{ name = "Future lights", run = function(dt)
+		FutureLights.update(dt)
+	end, stop = function()
+		FutureLights.stop()
+	end, turnOff = function()
+		Settings.set("mat.handLight", 1)
+		Settings.set("mat.neonLights", 1)
+		Settings.set("mat.lightningLight", false)
+		Settings.set("mat.bounceLight", 0)
+	end },
+	{ name = "Contact shadows", run = function(dt)
+		Contact.update(dt)
+	end, turnOff = off("mat.contactShadows", false) },
+	{ name = "Material sheen", run = function(dt)
+		Surfaces.update(dt)
+	end, stop = function()
+		Surfaces.releaseAll()
+	end, turnOff = off("mat.reflect", 1) },
+	{ name = "World recolour", run = function(dt)
+		Paint.update(dt)
+	end, stop = function()
+		Paint.releaseAll()
+	end, turnOff = off("cam.mixWorld", false) },
+	{ name = "Post-processing", run = function(dt)
+		Stage.post(dt)
+	end },
+	{ name = "Camera effects", run = function(dt)
+		Stage.camera(dt)
+	end },
+	-- After the camera, so mirrors aim from where the camera finally is.
+	{ name = "Real reflections", run = function(dt)
+		Mirrors.update(dt)
+	end, stop = function()
+		Mirrors.stop()
+	end, turnOff = function()
+		Settings.set("mat.mirrors", 1)
+		Settings.set("mat.chrome", 1)
+	end },
+	{ name = "Screen overlay", run = function(dt)
+		Overlay.update(dt)
+	end },
+}
+
+-- Notifications are drawn by the interface (section 21c); until it exists
+-- they wait in a queue.
+local Notify: { [string]: any } = { queue = {}, show = nil }
+
+function Notify.post(spec)
+	if Notify.show then
+		Notify.show(spec)
+	else
+		table.insert(Notify.queue, spec)
+	end
+end
+
+-- A short, readable form of an error: no script path, one line.
+local function shortError(message)
+	local text = tostring(message):gsub("^.-:%d+: ", "")
+	text = text:gsub("%s+", " ")
+	if #text > 140 then
+		text = text:sub(1, 137) .. "..."
+	end
+	return text
+end
+Notify.shortError = shortError
+
+-- Run something that must not take anything else down with it. Used for
+-- start-up and tear-down steps; failures are reported once, quietly.
+function Engine.safely(name, fn)
+	local ok, message = pcall(fn)
+	if not ok then
+		warn("[Solstice] " .. name .. " failed: " .. tostring(message))
+		Notify.post({
+			kind = "error",
+			title = name .. " ran into a problem",
+			body = shortError(message),
+		})
+	end
+	return ok
+end
+
+function Engine.setAside(stage, message)
+	stage.broken = true
+	stage.strikes = {}
+	if stage.stop then
+		pcall(stage.stop)
+	end
+	warn("[Solstice] " .. stage.name .. " was switched off after repeated errors: " .. tostring(message))
+	local actions = {
+		{ text = "Retry", onSelect = function()
+			stage.broken = false
+		end },
+	}
+	if stage.turnOff then
+		table.insert(actions, 1, { text = "Turn off", onSelect = function()
+			pcall(stage.turnOff)
+			stage.broken = false
+		end })
+	end
+	Notify.post({
+		kind = "error",
+		title = stage.name .. " stopped",
+		body = "It kept failing, so it was set aside; everything else keeps running. " .. shortError(message),
+		actions = actions,
+		duration = 14,
+	})
+end
+
+function Engine.run(stage, dt)
+	if stage.broken then
+		return
+	end
+	local ok, message = pcall(stage.run, dt)
+	if ok then
+		return
+	end
+	local now = os.clock()
+	stage.strikes = stage.strikes or {}
+	table.insert(stage.strikes, now)
+	while stage.strikes[1] and now - stage.strikes[1] > STRIKE_WINDOW do
+		table.remove(stage.strikes, 1)
+	end
+	if #stage.strikes == 1 then
+		warn("[Solstice] " .. stage.name .. ": " .. tostring(message))
+	end
+	if #stage.strikes >= STRIKES then
+		Engine.setAside(stage, message)
+	end
+end
+
+-- The frame itself (camera, adaptive quality, healing) is guarded too. If
+-- that keeps failing, nothing can render, so the shaders switch off, tell
+-- the player, and can be switched on again from the dock.
 function Engine.step(rawDt)
 	local ok, message = pcall(Engine.frame, rawDt)
-	if not ok then
-		Engine.faults += 1
-		if Engine.faults == 1 then
-			warn("[Solstice] frame error: " .. tostring(message))
-		elseif Engine.faults > 60 then
-			warn("[Solstice] too many errors, switching off")
-			Settings.setEnabled(false)
-		end
+	if ok then
+		Engine.faults = 0
+		return
+	end
+	Engine.faults += 1
+	if Engine.faults == 1 then
+		warn("[Solstice] frame error: " .. tostring(message))
+	elseif Engine.faults > 60 then
+		Engine.faults = 0
+		Settings.setEnabled(false)
+		Notify.post({
+			kind = "error",
+			title = "Shaders switched off",
+			body = "Every frame was failing, so Solstice restored the place and stopped. " .. shortError(message),
+			actions = { { text = "Turn back on", onSelect = function()
+				Settings.setEnabled(true)
+			end } },
+			duration = 16,
+		})
 	end
 end
 
@@ -9628,6 +10066,11 @@ function Engine.start()
 	end
 	Engine.running = true
 	Engine.faults = 0
+	-- A fresh start retries every feature that was set aside.
+	for _, stage in Engine.stages do
+		stage.broken = false
+		stage.strikes = {}
+	end
 
 	-- Nothing of the place is touched here. Atmosphere, Sky and Clouds are
 	-- taken over only when a setting asks (Held), the game's effects are only
@@ -9642,14 +10085,18 @@ function Engine.start()
 		Baseline.adopt(terrain, Look.waterProperties)
 	end
 
-	Stage.createEffects()
-	World.start()
-	Spectacle.start()
-	Lights.start()
-	Contact.start()
-	Underwater.start()
-	Overlay.start()
-	Registry.start()
+	for _, step in {
+		{ "Post-processing", Stage.createEffects },
+		{ "World", World.start },
+		{ "Sky", Spectacle.start },
+		{ "Lights", Lights.start },
+		{ "Contact shadows", Contact.start },
+		{ "Underwater", Underwater.start },
+		{ "Screen overlay", Overlay.start },
+		{ "Light tracking", Registry.start },
+	} do
+		Engine.safely(step[1], step[2])
+	end
 
 	table.clear(Engine.vital)
 	for _, instance in { Fx.bloom, Fx.sunRays, Fx.color, Fx.dof, Fx.blur, Fx.world, Overlay.screen } do
@@ -9696,20 +10143,26 @@ function Engine.stop()
 	table.clear(Engine.connections)
 	table.clear(Engine.vital)
 
-	Registry.stop()
-	Surfaces.releaseAll()
-	Paint.releaseAll()
-	Mirrors.stop()
-	Avatars.stop()
-	FutureLights.stop()
-	Held.dropAll()
-	Lights.stop()
-	Contact.stop()
-	Audio.stop()
-	Stage.releaseCamera()
-	Overlay.stop()
-	Baseline.restore()
-	Renderer.release()
+	-- Each step on its own, so one failing can never leave the place
+	-- half-restored (or the engine unable to start again).
+	for _, step in {
+		{ "Light tracking", Registry.stop },
+		{ "Material sheen", Surfaces.releaseAll },
+		{ "World recolour", Paint.releaseAll },
+		{ "Real reflections", Mirrors.stop },
+		{ "Avatar effects", Avatars.stop },
+		{ "Future lights", FutureLights.stop },
+		{ "Atmosphere", Held.dropAll },
+		{ "Lights", Lights.stop },
+		{ "Contact shadows", Contact.stop },
+		{ "Audio", Audio.stop },
+		{ "Camera", Stage.releaseCamera },
+		{ "Screen overlay", Overlay.stop },
+		{ "Restoring the place", Baseline.restore },
+		{ "Lighting style", Renderer.release },
+	} do
+		Engine.safely(step[1], step[2])
+	end
 	table.clear(Fx)
 
 	-- Forget ownership flags and eased state so the next start re-applies
@@ -9766,6 +10219,10 @@ local LAYOUT = {
 	dividerGap = 15, -- space between the last tab icon and the power icon
 	panelWidth = 420,
 	panelHeight = 600,
+	-- On the top and bottom edges the panel is wide and short instead: two
+	-- columns of rows, each as wide as the one-column page.
+	panelHeightWide = 500,
+	columnGap = 10,
 	edgeMargin = 12, -- gap between the surface and the screen edge
 	revealZone = 10, -- how close to the edge the pointer must come
 	hideDelay = 0.7, -- seconds the dock lingers after the pointer leaves
@@ -9817,13 +10274,65 @@ local Widgets = {}
 -- engine version still starts it below the inset, its AbsoluteSize comes up
 -- short of the viewport, and pointer positions are shifted to match; without
 -- this, everything dragged would sit that far below the pointer.
+--
+-- That guess is checked against the engine itself: whenever the pointer is
+-- over one of the interface's rows, buttons or icons, the engine has decided
+-- it is inside that object, which pins the offset between the pointer and
+-- the interface to a range. The ranges from every hover are intersected, so
+-- after a moment of moving over the panel the offset is known to a pixel,
+-- whatever its cause (a top bar, a container the executor parents to, a
+-- device inset).
+local calibration = { x = { -400, 400 }, y = { -400, 400 }, known = false }
+
+local function narrow(axis, low, high)
+	local range = calibration[axis]
+	local lo, hi = math.max(range[1], low), math.min(range[2], high)
+	if lo > hi then
+		-- Contradicts what was learned (the layout moved): start over.
+		lo, hi = low, high
+	end
+	range[1], range[2] = lo, hi
+end
+
+function UI.learnPointer(object)
+	if not object or not object.Parent then
+		return
+	end
+	local raw = UserInputService:GetMouseLocation()
+	local position, size = object.AbsolutePosition, object.AbsoluteSize
+	if size.X < 2 or size.Y < 2 then
+		return
+	end
+	-- raw - offset lies inside the object (give or take a pixel).
+	narrow("x", raw.X - position.X - size.X - 2, raw.X - position.X + 2)
+	narrow("y", raw.Y - position.Y - size.Y - 2, raw.Y - position.Y + 2)
+	calibration.known = true
+end
+
+local function settleOffset(range, preferred)
+	for _, candidate in preferred do
+		if candidate >= range[1] and candidate <= range[2] then
+			return candidate
+		end
+	end
+	return (range[1] + range[2]) / 2
+end
+
 function UI.origin()
+	local inset = GuiService:GetGuiInset()
 	local gui = UI.gui
 	local camera = Workspace.CurrentCamera
+	local guess = Vector2.zero
 	if gui and camera and camera.ViewportSize.Y - gui.AbsoluteSize.Y > 1 then
-		return (GuiService:GetGuiInset())
+		guess = inset
 	end
-	return Vector2.zero
+	if not calibration.known then
+		return guess
+	end
+	return Vector2.new(
+		settleOffset(calibration.x, { guess.X, 0, inset.X }),
+		settleOffset(calibration.y, { guess.Y, 0, inset.Y })
+	)
 end
 
 -- The key that opens and closes the panel (Settings > Behaviour).
@@ -9963,9 +10472,10 @@ do
 
 	-- Four dots showing a load score of 0..4. Green is cheap, red is not.
 	function Widgets.pips(parent, order)
+		-- A little taller than the dots, so it is easy to hover for its tooltip.
 		local holder = create("Frame", {
 			Name = "Load",
-			Size = UDim2.fromOffset(22, 6),
+			Size = UDim2.fromOffset(24, 14),
 			BackgroundTransparency = 1,
 			LayoutOrder = order,
 			Parent = parent,
@@ -9973,7 +10483,7 @@ do
 		local dots = {}
 		for index = 1, 4 do
 			dots[index] = create("Frame", {
-				Position = UDim2.fromOffset((index - 1) * 6, 1),
+				Position = UDim2.fromOffset(1 + (index - 1) * 6, 5),
 				Size = UDim2.fromOffset(4, 4),
 				BackgroundColor3 = THEME.controlActive,
 				BorderSizePixel = 0,
@@ -10337,31 +10847,29 @@ do
 		if style.stroke then
 			outline(THEME.border).Parent = item
 		end
-		local scale = create("UIScale", { Parent = item })
-		local press = Motion.spring(1, 6, 0.5, function(value)
-			scale.Scale = value
-		end)
-		item.MouseEnter:Connect(function()
-			tween(item, 0.12, {
-				BackgroundColor3 = THEME[style.hover],
-				BackgroundTransparency = style.hoverAlpha or style.alpha or 0,
-				TextColor3 = THEME[style.hoverText or style.text],
+		-- Press feedback is a darker fill, not a scale: scaling would
+		-- re-rasterise the label and make its weight flicker.
+		local hovered = false
+		local function settle()
+			tween(item, hovered and 0.12 or 0.18, {
+				BackgroundColor3 = THEME[hovered and style.hover or style.fill],
+				BackgroundTransparency = hovered and (style.hoverAlpha or style.alpha or 0) or (style.alpha or 0),
+				TextColor3 = THEME[hovered and (style.hoverText or style.text) or style.text],
 			})
+		end
+		item.MouseEnter:Connect(function()
+			UI.learnPointer(item)
+			hovered = true
+			settle()
 		end)
 		item.MouseLeave:Connect(function()
-			press:to(1)
-			tween(item, 0.18, {
-				BackgroundColor3 = THEME[style.fill],
-				BackgroundTransparency = style.alpha or 0,
-				TextColor3 = THEME[style.text],
-			})
+			hovered = false
+			settle()
 		end)
 		item.MouseButton1Down:Connect(function()
-			press:to(0.95)
+			tween(item, 0.06, { BackgroundColor3 = THEME[style.hover]:Lerp(Color3.new(0, 0, 0), 0.12) })
 		end)
-		item.MouseButton1Up:Connect(function()
-			press:to(1)
-		end)
+		item.MouseButton1Up:Connect(settle)
 		return item
 	end
 
@@ -11587,6 +12095,9 @@ do
 		local pips, setPips = nil, nil
 		if (item.maxLoad or 0) > 0 then
 			pips, setPips = Widgets.pips(head, 2)
+			UI.tip(pips, function()
+				return UI.pipTip(item)
+			end)
 		end
 
 		local lock = nil
@@ -11793,7 +12304,11 @@ do
 		end
 
 		slot.MouseEnter:Connect(function()
+			UI.learnPointer(slot)
 			tween(body, 0.12, { BackgroundTransparency = 0 })
+		end)
+		slot.MouseMoved:Connect(function()
+			UI.learnPointer(slot)
 		end)
 		-- Rows with a menu open it on a right-click.
 		if item.menu then
@@ -12445,6 +12960,25 @@ function UI.edgeOrigin(viewport)
 	return Vector2.new(viewport.X / 2, viewport.Y)
 end
 
+-- How far the dock moves out to hide: off the screen entirely, which on the
+-- top edge includes the strip behind Roblox's top bar.
+function UI.hideDistance()
+	local extra = UI.sideName() == "top" and GuiService:GetGuiInset().Y or 0
+	return LAYOUT.dockWidth + LAYOUT.edgeMargin + 10 + extra
+end
+
+-- The open panel's size in edge terms: across the edge (thick), along it
+-- (long). On the left and right it is tall; on the top and bottom, wide.
+function UI.panelSize(viewport)
+	local L = LAYOUT
+	if SIDES[UI.sideName()].vertical then
+		return L.panelWidth, math.min(L.panelHeight, viewport.Y - 48)
+	end
+	local restLong = (UI.dockRest or 0) + L.dockPadding * 2
+	local thick = math.min(L.panelHeightWide, viewport.Y - 48 - GuiService:GetGuiInset().Y)
+	return thick, math.min(math.max(UI.pageWidth or 0, restLong), viewport.X - 24)
+end
+
 -- Turns a point on screen into edge terms.
 function UI.toEdge(point, viewport)
 	local side = SIDES[UI.sideName()]
@@ -12710,21 +13244,6 @@ function UI.buildShell()
 	})
 	UI.holder = holder
 
-	-- Three stacked translucent frames stand in for a soft drop shadow.
-	for layer = 1, 3 do
-		create("Frame", {
-			Name = "Shadow",
-			AnchorPoint = Vector2.new(0.5, 0.5),
-			Position = UDim2.new(0.5, 0, 0.5, 2 + layer * 2),
-			Size = UDim2.new(1, layer * 6, 1, layer * 6),
-			BackgroundColor3 = rgb(0, 0, 0),
-			BackgroundTransparency = (THEME.light and 0.9 or 0.8) + layer * 0.03,
-			BorderSizePixel = 0,
-			ZIndex = 0,
-			Parent = holder,
-		}, { corner(RADIUS.dock + layer * 3) })
-	end
-
 	local shell = create("Frame", {
 		Name = "Shell",
 		Size = UDim2.fromScale(1, 1),
@@ -12742,7 +13261,10 @@ function UI.buildShell()
 	-- The page keeps its final width at all times and is clipped by `content`,
 	-- which grows with the shell. So the morph reveals the page rather than
 	-- reflowing it, and nothing inside has to re-layout while it animates.
-	local pageWidth = L.panelWidth - L.dockWidth
+	local columnWidth = L.panelWidth - L.dockWidth
+	local pageWidth = vertical and columnWidth or columnWidth * 2 + L.columnGap
+	UI.columns = vertical and 1 or 2
+	UI.pageWidth = pageWidth
 	local content = create("Frame", {
 		Name = "Content",
 		BackgroundTransparency = 1,
@@ -12793,7 +13315,9 @@ function UI.buildShell()
 	UI.content = content
 	UI.rail = rail
 
-	-- The welcome island: shown on launch, before the shell becomes the dock.
+	-- The welcome island (UI.playWelcome): a sun rising over a horizon line,
+	-- the name written in letter by letter, a greeting for the time of day,
+	-- and the key that opens the panel.
 	local welcome = create("CanvasGroup", {
 		Name = "Welcome",
 		Size = UDim2.fromScale(1, 1),
@@ -12802,43 +13326,115 @@ function UI.buildShell()
 		Visible = false,
 		ZIndex = 4,
 		Parent = shell,
+	})
+	local mark = create("Frame", {
+		Position = UDim2.new(0, 16, 0.5, -18),
+		Size = UDim2.fromOffset(36, 36),
+		BackgroundTransparency = 1,
+		Parent = welcome,
+	})
+	-- Everything above the horizon; the sun rises into it from below.
+	local sky = create("Frame", {
+		Size = UDim2.new(1, 0, 0, 25),
+		BackgroundTransparency = 1,
+		ClipsDescendants = true,
+		Parent = mark,
+	})
+	local glow = create("ImageLabel", {
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.new(0.5, 0, 0, 42),
+		Size = UDim2.fromOffset(46, 46),
+		BackgroundTransparency = 1,
+		Image = CONFIG.ParticleTexture,
+		ImageColor3 = rgb(255, 168, 96),
+		ImageTransparency = 1,
+		Parent = sky,
+	})
+	local sun = create("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.new(0.5, 0, 0, 42),
+		Size = UDim2.fromOffset(16, 16),
+		BackgroundColor3 = Color3.new(1, 1, 1),
+		BorderSizePixel = 0,
+		Parent = sky,
+	}, {
+		corner(8),
+		create("UIGradient", { Rotation = 90, Color = ColorSequence.new(rgb(255, 222, 150), rgb(255, 122, 82)) }),
+	})
+	create("Frame", {
+		Position = UDim2.fromOffset(0, 25),
+		Size = UDim2.new(1, 0, 0, 2),
+		BackgroundColor3 = THEME.text,
+		BorderSizePixel = 0,
+		Parent = mark,
+	}, {
+		corner(1),
+		create("UIGradient", {
+			Transparency = NumberSequence.new({
+				NumberSequenceKeypoint.new(0, 1),
+				NumberSequenceKeypoint.new(0.5, 0.15),
+				NumberSequenceKeypoint.new(1, 1),
+			}),
+		}),
+	})
+	-- The name, one masked letter at a time.
+	local nameRow = create("Frame", {
+		Position = UDim2.new(0, 64, 0.5, -20),
+		Size = UDim2.fromOffset(150, 21),
+		BackgroundTransparency = 1,
+		Parent = welcome,
 	}, {
 		create("UIListLayout", {
 			FillDirection = Enum.FillDirection.Horizontal,
-			HorizontalAlignment = Enum.HorizontalAlignment.Center,
-			VerticalAlignment = Enum.VerticalAlignment.Center,
 			SortOrder = Enum.SortOrder.LayoutOrder,
-			Padding = UDim.new(0, 11),
 		}),
 	})
-	local mark = create("Frame", {
-		Size = UDim2.fromOffset(30, 30),
-		BackgroundColor3 = THEME.accent,
-		BorderSizePixel = 0,
-		LayoutOrder = 1,
-		Parent = welcome,
-	}, { corner(15) })
-	local markParts = Glyph.build(mark, "atmo")
-	for _, part in markParts do
-		(part.instance :: any)[part.property] = THEME.textOnAccent
+	local letters = {}
+	for index, character in string.split("Solstice", "") do
+		local ok, bounds = pcall(TextService.GetTextSize, TextService, character, 16, Enum.Font.GothamBold, Vector2.new(100, 100))
+		local cell = create("Frame", {
+			Size = UDim2.fromOffset((ok and bounds.X or 9) + 0.5, 21),
+			BackgroundTransparency = 1,
+			ClipsDescendants = true,
+			LayoutOrder = index,
+			Parent = nameRow,
+		})
+		letters[index] = label(character, 16, THEME.text, FONT.bold, {
+			Position = UDim2.fromOffset(0, 21),
+			Size = UDim2.new(1, 4, 1, 0),
+			Parent = cell,
+		})
 	end
-	local words = create("Frame", {
-		Size = UDim2.fromOffset(150, 34),
-		BackgroundTransparency = 1,
-		LayoutOrder = 2,
+	local hour = (os.date("*t") :: any).hour
+	local greetingWord = (hour >= 5 and hour < 12) and "Good morning"
+		or (hour >= 12 and hour < 18) and "Good afternoon"
+		or (hour >= 18 and hour < 23) and "Good evening"
+		or "Up late"
+	local greeting = label(greetingWord .. ", " .. localPlayer.DisplayName, 11, THEME.textSecondary, FONT.medium, {
+		Position = UDim2.new(0, 64, 0.5, 3),
+		Size = UDim2.new(1, -124, 0, 14),
+		TextTransparency = 1,
+		TextTruncate = Enum.TextTruncate.AtEnd,
 		Parent = welcome,
-	})
-	label("Solstice", 15, THEME.text, FONT.bold, {
-		Size = UDim2.new(1, 0, 0, 18),
-		Parent = words,
 	})
 	local key = Settings.items["ui.toggleKey"] and Settings.items["ui.toggleKey"].options[get("ui.toggleKey")] or "F6"
-	label("Shaders ready  ·  " .. key .. " to open", 11, THEME.textTertiary, FONT.medium, {
-		Position = UDim2.fromOffset(0, 19),
-		Size = UDim2.new(1, 0, 0, 14),
-		Parent = words,
+	local keyStroke = outline(THEME.borderStrong, 1)
+	local keycap = label(key, 11, THEME.textSecondary, FONT.bold, {
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, -16, 0.5, 0),
+		Size = UDim2.fromOffset(0, 22),
+		AutomaticSize = Enum.AutomaticSize.X,
+		BackgroundColor3 = THEME.control,
+		BackgroundTransparency = 1,
+		TextTransparency = 1,
+		TextXAlignment = Enum.TextXAlignment.Center,
+		Parent = welcome,
 	})
+	corner(5).Parent = keycap
+	keyStroke.Parent = keycap
+	create("UIPadding", { PaddingLeft = UDim.new(0, 7), PaddingRight = UDim.new(0, 7), Parent = keycap })
 	UI.welcome = welcome
+	UI.welcomeParts = { sun = sun, glow = glow, letters = letters, greeting = greeting, keycap = keycap, keyStroke = keyStroke }
 
 	-- Dialogs and menus draw above everything.
 	UI.layer = create("Frame", {
@@ -12856,7 +13452,7 @@ function UI.buildShell()
 		thick = Motion.spring(L.dockWidth, 3.4, 0.72),
 		long = Motion.spring(100, 3.4, 0.72),
 		radius = Motion.spring(RADIUS.dock, 4, 1),
-		hide = Motion.spring(L.dockWidth + L.edgeMargin + 10, 3.6, 0.68),
+		hide = Motion.spring(UI.hideDistance(), 3.6, 0.68),
 	}
 
 	return page, rail
@@ -12930,6 +13526,7 @@ function UI.buildPage(page)
 		LayoutOrder = 2,
 		Parent = chip,
 	})
+	UI.tip(chip, UI.rendererTip)
 
 	local close = button({
 		Name = "Close",
@@ -12969,6 +13566,7 @@ function UI.buildPage(page)
 		Parent = page,
 	})
 	chrome.strip = Widgets.animatable(strip, UDim2.fromOffset(0, 60))
+	UI.tip(strip, UI.loadTip)
 	label("LOAD", 9, THEME.textTertiary, FONT.bold, {
 		Position = UDim2.fromOffset(18, 0),
 		Size = UDim2.new(0, 34, 1, 0),
@@ -13011,7 +13609,7 @@ function UI.buildPage(page)
 		Parent = page,
 	})
 	chrome.subtabs = Widgets.animatable(subtabs, UDim2.fromOffset(0, 84))
-	local barWidth = LAYOUT.panelWidth - LAYOUT.dockWidth - 36
+	local barWidth = UI.pageWidth - 36
 	for _, tab in TABS do
 		if tab.locked then
 			continue
@@ -13050,13 +13648,32 @@ function UI.buildPage(page)
 		ScrollBarImageColor3 = THEME.borderStrong,
 		Parent = page,
 	}, {
-		create("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder }),
+		create("UIListLayout", {
+			FillDirection = UI.columns == 2 and Enum.FillDirection.Horizontal or Enum.FillDirection.Vertical,
+			Padding = UDim.new(0, UI.columns == 2 and LAYOUT.columnGap - 6 or 0),
+			SortOrder = Enum.SortOrder.LayoutOrder,
+		}),
 		create("UIPadding", {
 			PaddingLeft = UDim.new(0, 8),
 			PaddingRight = UDim.new(0, 8),
 			PaddingBottom = UDim.new(0, 8),
 		}),
 	})
+	-- Two columns on the top and bottom edges.
+	UI.columnFrames = nil
+	if UI.columns == 2 then
+		UI.columnFrames = {}
+		for index = 1, 2 do
+			UI.columnFrames[index] = create("Frame", {
+				Name = "Column" .. index,
+				Size = UDim2.new(0.5, -(LAYOUT.columnGap - 6) / 2, 0, 0),
+				AutomaticSize = Enum.AutomaticSize.Y,
+				BackgroundTransparency = 1,
+				LayoutOrder = index,
+				Parent = UI.scroll,
+			}, { create("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder }) })
+		end
+	end
 
 	-- Every section's rows are built once up front and simply re-parented
 	-- when shown, so switching tabs or sections never constructs instances.
@@ -13188,8 +13805,8 @@ function UI.refreshSection(tabId, sectionId)
 		UI.currentRows = rows
 		for _, row in rows do
 			row.anim.hide()
-			row.slot.Parent = UI.scroll
 		end
+		UI.placeRows(rows)
 		if UI.expanded and not UI.closing then
 			UI.enterRows(UI.sequence, 0)
 		end
@@ -13265,6 +13882,9 @@ function UI.buildDock(rail)
 		entry.parts = Glyph.build(entry.button, entry.id)
 		entry.scale = Motion.spring(1, 5, 0.62) -- magnification
 		entry.press = Motion.spring(1, 5, 0.42) -- click bounce
+		entry.button.MouseMoved:Connect(function()
+			UI.learnPointer(entry.button)
+		end)
 		entry.button.Activated:Connect(function()
 			entry.press:snap(0.82)
 			entry.press:to(1)
@@ -13355,6 +13975,100 @@ function UI.setHovered(entry)
 	end
 end
 
+-- Tooltip texts for the header chips and the load pips.
+local LOAD_WORDS = { "light", "moderate", "heavy", "very heavy" }
+local PIPELINES = {
+	Future = "Future: Roblox's most detailed lighting. Every light is drawn per pixel, and lamps, torches and screens can cast real shadows.",
+	ShadowMap = "ShadowMap: the sun casts sharp shadows, but lamps and other local lights do not. Future-only rows are locked.",
+	Voxel = "Voxel: light is worked out in 4-stud blocks. Soft and cheap, with no shadow maps; Materials > Voxel recreates some Future looks.",
+	Compatibility = "Compatibility: the legacy pipeline, closest to old Roblox lighting. Future-only rows are locked.",
+	Unknown = "The lighting pipeline could not be read, so Solstice assumes shadow maps.",
+}
+
+function UI.rendererTip()
+	local lines = { PIPELINES[Renderer.technology] or PIPELINES.Unknown }
+	if Renderer.requested then
+		table.insert(lines, "Forced by Atmosphere > Realistic lighting; switching that off restores the place's own style.")
+	end
+	if Renderer.quality == 0 then
+		table.insert(lines, "Graphics quality: Automatic.")
+	else
+		table.insert(lines, string.format("Graphics quality: %d of 10. Future's extras need %d or higher.", Renderer.quality, CONFIG.MinQualityForFuture))
+	end
+	table.insert(lines, "Dot: green full Future, yellow shadow maps or held back, orange voxel.")
+	return table.concat(lines, "\n")
+end
+
+function UI.loadTip()
+	local total = Settings.totalLoad()
+	local budget = CONFIG.LoadBudget
+	local costs = {}
+	for _, item in Settings.items do
+		local load = Settings.itemLoad(item)
+		if load > 0 then
+			table.insert(costs, { item = item, load = load })
+		end
+	end
+	table.sort(costs, function(a, b)
+		return a.load > b.load
+	end)
+	local lines = {
+		string.format(
+			"Load %d%%: the effects you have on add up to %d of a %d-point budget. Each pip is one point, about %d%% of the budget.",
+			math.floor(math.min(total / budget, 1) * 100 + 0.5),
+			total,
+			budget,
+			math.floor(100 / budget + 0.5)
+		),
+	}
+	if #costs > 0 then
+		local top = {}
+		for index = 1, math.min(#costs, 4) do
+			table.insert(top, string.format("%s %d", costs[index].item.name, costs[index].load))
+		end
+		table.insert(lines, "Biggest now: " .. table.concat(top, ", ") .. ".")
+	end
+	local fps = math.floor(Adaptive.fps + 0.5)
+	if get("ui.adaptive") then
+		table.insert(lines, string.format(
+			"Adaptive quality: %s (about %d fps, target %d).",
+			Settings.governor > 0 and ("easing costly effects by " .. Settings.governor .. " step" .. (Settings.governor > 1 and "s" or ""))
+				or "not needed right now",
+			fps,
+			get("ui.targetFps")
+		))
+	else
+		table.insert(lines, string.format("Adaptive quality is off (about %d fps).", fps))
+	end
+	return table.concat(lines, "\n")
+end
+
+function UI.pipTip(item)
+	local load = Settings.itemLoad(item)
+	local most = item.maxLoad or 0
+	local share = function(points)
+		return math.floor(points / CONFIG.LoadBudget * 100 + 0.5)
+	end
+	if not Settings.isAvailable(item) then
+		return "Not available with this lighting, so it costs nothing."
+	end
+	local text
+	if load == 0 then
+		text = string.format("Performance: no cost at this setting. Up to %d of 4 (%s, about %d%% of the budget) when raised.", most, LOAD_WORDS[math.max(most, 1)], share(most))
+	else
+		text = string.format("Performance: %d of 4, %s. About %d%% of the load budget.", load, LOAD_WORDS[load], share(load))
+		if item.scaled then
+			text ..= " Grows as the slider goes up."
+		elseif item.kind == "tier" and load < most then
+			text ..= " Higher steps cost more."
+		end
+	end
+	if item.kind == "tier" and Settings.tier(item.id) < Settings.values[item.id] then
+		text ..= " Adaptive quality is holding it a step lower for now."
+	end
+	return text
+end
+
 -- Everything in the header and footer that reflects global state.
 function UI.syncChrome()
 	local fraction = math.min(Settings.totalLoad() / CONFIG.LoadBudget, 1)
@@ -13387,6 +14101,40 @@ function UI.syncChrome()
 	UI.paintDock()
 end
 
+-- Put a section's rows into the list: one column, or (top and bottom edges)
+-- two, split at a heading near the middle so each group stays together and
+-- the columns come out about even.
+function UI.placeRows(rows)
+	local columns = UI.columnFrames
+	if not columns then
+		for _, row in rows do
+			row.slot.Parent = UI.scroll
+		end
+		return
+	end
+	local total, headings = 0, false
+	for _, row in rows do
+		total += row.slot.Size.Y.Offset
+		headings = headings or row.slot.Name == "Group"
+	end
+	local best, bestGap = #rows + 1, math.huge
+	local running = 0
+	for index, row in rows do
+		-- A column may start at any heading, or anywhere if there are none.
+		local heading = row.slot.Name == "Group"
+		if index > 1 and (heading or not headings) then
+			local gap = math.abs(running - total / 2)
+			if gap < bestGap then
+				best, bestGap = index, gap
+			end
+		end
+		running += row.slot.Size.Y.Offset
+	end
+	for index, row in rows do
+		row.slot.Parent = index < best and columns[1] or columns[2]
+	end
+end
+
 -- Swap the scrolling list over to a tab's current section (rows start hidden).
 function UI.populate(tabId)
 	-- An editor left open is cancelled, so nothing stays half-edited.
@@ -13405,8 +14153,8 @@ function UI.populate(tabId)
 	UI.currentRows = UI.rowsByTab[tabId .. "/" .. UI.activeSection[tabId]] or {}
 	for _, row in UI.currentRows do
 		row.anim.hide()
-		row.slot.Parent = UI.scroll
 	end
+	UI.placeRows(UI.currentRows)
 	UI.title.Text = tab.title
 	UI.blurb.Text = tab.blurb
 	UI.scroll.CanvasPosition = Vector2.zero
@@ -13590,9 +14338,55 @@ end
 -- appears as a small pill that springs open into a wide one with the
 -- Solstice mark, holds a moment, then folds itself into the dock, the way
 -- the iPhone's Dynamic Island grows and shrinks around what it shows.
-local INTRO_HOLD = 2.6
-local INTRO_THICK = { vertical = 236, horizontal = 56 }
-local INTRO_LONG = { vertical = 56, horizontal = 236 }
+local INTRO_HOLD = 3.1
+local INTRO_THICK = { vertical = 284, horizontal = 64 }
+local INTRO_LONG = { vertical = 64, horizontal = 284 }
+
+-- The island's content: the sun rises out of the horizon with its glow,
+-- the letters lift into place one after another, then the greeting and the
+-- key settle in.
+function UI.playWelcome()
+	local parts = UI.welcomeParts
+	local token = {}
+	UI.welcomeToken = token
+	tween(UI.welcome, 0.2, { GroupTransparency = 0 })
+	tween(parts.sun, 1.1, { Position = UDim2.new(0.5, 0, 0, 12) }, Enum.EasingStyle.Quint)
+	tween(parts.glow, 1.4, { Position = UDim2.new(0.5, 0, 0, 12), ImageTransparency = 0.3 }, Enum.EasingStyle.Quint)
+	for index, glyph in parts.letters do
+		task.delay(0.18 + index * 0.045, function()
+			if UI.welcomeToken == token then
+				tween(glyph, 0.5, { Position = UDim2.fromOffset(0, 0) }, Enum.EasingStyle.Back)
+			end
+		end)
+	end
+	task.delay(0.75, function()
+		if UI.welcomeToken == token then
+			tween(parts.greeting, 0.45, { TextTransparency = 0 })
+			tween(parts.keycap, 0.45, { TextTransparency = 0, BackgroundTransparency = 0 })
+			tween(parts.keyStroke, 0.45, { Transparency = 0 })
+		end
+	end)
+end
+
+-- The same, backwards: letters lift out, the sun sets, the rest fades.
+function UI.closeWelcome()
+	local parts = UI.welcomeParts
+	UI.welcomeToken = {}
+	local count = #parts.letters
+	for index, glyph in parts.letters do
+		task.delay((count - index) * 0.02, function()
+			tween(glyph, 0.22, { Position = UDim2.fromOffset(0, -21) }, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+		end)
+	end
+	tween(parts.sun, 0.35, { Position = UDim2.new(0.5, 0, 0, 42) }, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+	tween(parts.glow, 0.35, { Position = UDim2.new(0.5, 0, 0, 42), ImageTransparency = 1 })
+	tween(parts.greeting, 0.2, { TextTransparency = 1 })
+	tween(parts.keycap, 0.2, { TextTransparency = 1, BackgroundTransparency = 1 })
+	tween(parts.keyStroke, 0.2, { Transparency = 1 })
+	task.delay(0.25, function()
+		tween(UI.welcome, 0.15, { GroupTransparency = 1 })
+	end)
+end
 
 -- Skip straight to the dock (the panel was opened during the welcome).
 function UI.endIntro()
@@ -13639,10 +14433,7 @@ function UI.step(dt)
 	local vertical = side.vertical
 	local mouseAlong, mouseAcross = UI.toEdge(UI.mouse(), viewport)
 	local restLong = UI.dockRest + L.dockPadding * 2
-	local panelLong = vertical and math.min(L.panelHeight, viewport.Y - 48)
-		or math.max(L.panelWidth - L.dockWidth, restLong)
-	local panelThick = vertical and L.panelWidth
-		or math.min(L.panelHeight, viewport.Y - 48 - GuiService:GetGuiInset().Y)
+	local panelThick, panelLong = UI.panelSize(viewport)
 
 	---- Morph targets ----------------------------------------------------------
 	local intro = UI.intro
@@ -13652,16 +14443,16 @@ function UI.step(dt)
 		if intro.phase == 1 then
 			geo.thick:to(INTRO_THICK[shape])
 			geo.long:to(INTRO_LONG[shape])
-			geo.radius:to(28)
-			if age > 0.18 and not intro.shownText then
+			geo.radius:to(32)
+			if age > 0.12 and not intro.shownText then
 				intro.shownText = true
-				tween(UI.welcome, 0.25, { GroupTransparency = 0 })
+				UI.playWelcome()
 			end
 			if age > INTRO_HOLD then
 				intro.phase = 2
-				tween(UI.welcome, 0.15, { GroupTransparency = 1 })
+				UI.closeWelcome()
 			end
-		elseif age > INTRO_HOLD + 0.12 then
+		elseif age > INTRO_HOLD + 0.42 then
 			UI.endIntro()
 			UI.peekUntil = now + 2.5
 			for index, entry in UI.dock do
@@ -13696,7 +14487,7 @@ function UI.step(dt)
 	local shouldShow = now - UI.lastSeen < L.hideDelay
 	if shouldShow ~= UI.shown then
 		UI.shown = shouldShow
-		geo.hide:to(shouldShow and 0 or L.dockWidth + L.edgeMargin + 10)
+		geo.hide:to(shouldShow and 0 or UI.hideDistance())
 		tween(UI.handle, 0.2, { BackgroundTransparency = shouldShow and 1 or 0.25 })
 	end
 
@@ -13895,19 +14686,24 @@ do
 			Parent = layer,
 		})
 		local centre = dialogCentre()
+		-- The border is drawn outside the group's image, so it fades on its
+		-- own, in step with the card.
+		local stroke = outline(THEME.borderStrong, 1)
 		local card = create("CanvasGroup", {
 			Name = "Dialog",
 			AnchorPoint = Vector2.new(0.5, 0.5),
-			Position = UDim2.fromOffset(centre.X, centre.Y),
+			Position = UDim2.fromOffset(centre.X, centre.Y + 28),
 			Size = UDim2.fromOffset(DIALOG_WIDTH, 100),
 			BackgroundColor3 = THEME.surface,
 			GroupTransparency = 1,
 			ZIndex = 2,
 			Parent = layer,
-		}, { corner(RADIUS.shell), outline(THEME.borderStrong) })
-		local scale = create("UIScale", { Scale = 0.86, Parent = card })
-		local pop = Motion.spring(0.86, 3.6, 0.48, function(value)
-			scale.Scale = value
+		}, { corner(RADIUS.shell), stroke })
+		-- The bounce is a springy rise into place, not a scale: scaling a
+		-- group re-rasterises its text every frame, which makes the font
+		-- appear to flicker between weights.
+		local pop = Motion.spring(28, 3.6, 0.45, function(value)
+			card.Position = UDim2.fromOffset(centre.X, centre.Y + value)
 		end)
 
 		label(spec.title or "", 15, THEME.text, FONT.bold, {
@@ -13920,7 +14716,6 @@ do
 			local body = label(spec.body, 12, THEME.textSecondary, FONT.regular, {
 				Position = UDim2.fromOffset(20, top),
 				Size = UDim2.new(1, -40, 0, 0),
-				AutomaticSize = Enum.AutomaticSize.Y,
 				TextWrapped = true,
 				TextYAlignment = Enum.TextYAlignment.Top,
 				LineHeight = 1.15,
@@ -13958,8 +14753,9 @@ do
 		local blur = backdropBlur()
 		tween(dim, 0.22, { BackgroundTransparency = 0.45 })
 		tween(card, 0.16, { GroupTransparency = 0 })
+		tween(stroke, 0.16, { Transparency = 0 })
 		tween(blur, 0.25, { Size = 14 })
-		pop:to(1)
+		pop:to(0)
 		Overlay.holdCursor = true
 
 		function dialog.close(confirmed, instant)
@@ -13979,8 +14775,9 @@ do
 				return
 			end
 			-- The opening motion, played backwards.
-			pop:to(0.9)
+			pop:to(18)
 			tween(card, 0.14, { GroupTransparency = 1 })
+			tween(stroke, 0.14, { Transparency = 1 })
 			tween(dim, 0.2, { BackgroundTransparency = 1 })
 			if not UI.dialog then
 				tween(blur, 0.22, { Size = 0 })
@@ -14115,9 +14912,10 @@ do
 		local viewport = camera and camera.ViewportSize or Vector2.new(1280, 720)
 		local x = math.clamp(position.X + 2, 4, viewport.X - width - 4)
 		local y = math.clamp(position.Y + 2, 4, viewport.Y - height - 4)
+		local stroke = outline(THEME.borderStrong, 1)
 		local card = create("CanvasGroup", {
 			Name = "Menu",
-			Position = UDim2.fromOffset(x, y),
+			Position = UDim2.fromOffset(x, y - 6),
 			Size = UDim2.fromOffset(width, height),
 			BackgroundColor3 = THEME.surfaceRaised,
 			GroupTransparency = 1,
@@ -14125,7 +14923,7 @@ do
 			Parent = layer,
 		}, {
 			corner(RADIUS.row),
-			outline(THEME.borderStrong),
+			stroke,
 			create("UIPadding", {
 				PaddingTop = UDim.new(0, 4),
 				PaddingBottom = UDim.new(0, 4),
@@ -14134,17 +14932,18 @@ do
 			}),
 			create("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder }),
 		})
-		local scale = create("UIScale", { Scale = 0.94, Parent = card })
-		local pop = Motion.spring(0.94, 5, 0.6, function(value)
-			scale.Scale = value
+		local pop = Motion.spring(-6, 5, 0.6, function(value)
+			card.Position = UDim2.fromOffset(x, y + value)
 		end)
-		pop:to(1)
+		pop:to(0)
 		tween(card, 0.1, { GroupTransparency = 0 })
+		tween(stroke, 0.1, { Transparency = 0 })
 
 		local menu = {}
 		function menu.close()
 			catcher:Destroy()
 			tween(card, 0.08, { GroupTransparency = 1 })
+			tween(stroke, 0.08, { Transparency = 1 })
 			task.delay(0.1, function()
 				card:Destroy()
 			end)
@@ -14184,6 +14983,277 @@ do
 	end
 end
 
+--------------------------------------------------------------------------------
+-- 21c. NOTIFICATIONS AND TOOLTIPS
+--     Toasts, after shadcn's Sonner: a small card in the corner with an icon,
+--     a title, a line or two of detail and up to two actions. They stack,
+--     newest nearest the corner, slide in, and leave on their own (hovering
+--     one keeps it). Errors from the safeguards (section 16) arrive here.
+--
+--     Tooltips, after shadcn's Tooltip: a compact inverted label that
+--     appears a moment after the pointer settles on something, above it.
+--       UI.tip(object, text or function returning text)
+--------------------------------------------------------------------------------
+
+do
+	local corner, outline, label = Widgets.corner, Widgets.outline, Widgets.label
+	local TOAST_WIDTH = 340
+	local toasts = {}
+	local KINDS = {
+		error = { color = "red", glyph = "!" },
+		info = { color = "accent", glyph = "i" },
+		success = { color = "green", glyph = "✓" },
+	}
+
+	-- Toasts sit in the bottom-right corner, or the top-right when the dock
+	-- is on the bottom edge.
+	local function restack()
+		local camera = Workspace.CurrentCamera
+		local viewport = camera and camera.ViewportSize or Vector2.new(1280, 720)
+		local fromTop = UI.sideName() == "bottom"
+		local offset = 0
+		for index = #toasts, 1, -1 do
+			local toast = toasts[index]
+			local y = fromTop and (GuiService:GetGuiInset().Y + 16 + offset) or (viewport.Y - 16 - offset - toast.height)
+			toast.x = viewport.X - 16 - TOAST_WIDTH
+			toast.y:to(y)
+			offset += toast.height + 8
+		end
+	end
+
+	local function dismiss(toast)
+		if toast.gone then
+			return
+		end
+		toast.gone = true
+		local index = table.find(toasts, toast)
+		if index then
+			table.remove(toasts, index)
+		end
+		tween(toast.card, 0.16, { GroupTransparency = 1 })
+		tween(toast.stroke, 0.16, { Transparency = 1 })
+		toast.slide:to(24)
+		restack()
+		task.delay(0.2, function()
+			toast.card:Destroy()
+		end)
+	end
+
+	function UI.clearToasts()
+		for _, toast in table.clone(toasts) do
+			toast.gone = true
+			toast.card:Destroy()
+		end
+		table.clear(toasts)
+	end
+
+	function UI.toast(spec)
+		if not UI.layer then
+			table.insert(Notify.queue, spec)
+			return
+		end
+		local kind = KINDS[spec.kind or "info"] or KINDS.info
+		local body = spec.body or ""
+		local lines = body == "" and 0 or math.min(4, math.ceil(#body * 6 / (TOAST_WIDTH - 72)))
+		local actions = spec.actions or {}
+		local height = 16 + 18 + lines * 16 + (#actions > 0 and 36 or 0) + 14
+		local stroke = outline(THEME.borderStrong, 1)
+		local card = create("CanvasGroup", {
+			Name = "Toast",
+			Size = UDim2.fromOffset(TOAST_WIDTH, height),
+			BackgroundColor3 = THEME.surfaceRaised,
+			GroupTransparency = 1,
+			ZIndex = 5,
+			Parent = UI.layer,
+		}, { corner(RADIUS.shell), stroke })
+		local tint = THEME[kind.color]
+		create("TextLabel", {
+			Position = UDim2.fromOffset(14, 16),
+			Size = UDim2.fromOffset(20, 20),
+			BackgroundColor3 = tint,
+			BackgroundTransparency = 0.82,
+			Text = kind.glyph,
+			TextSize = 12,
+			FontFace = FONT.bold,
+			TextColor3 = tint,
+			Parent = card,
+		}, { corner(10) })
+		label(spec.title or "", 13, THEME.text, FONT.medium, {
+			Position = UDim2.fromOffset(44, 16),
+			Size = UDim2.new(1, -78, 0, 18),
+			TextTruncate = Enum.TextTruncate.AtEnd,
+			Parent = card,
+		})
+		if lines > 0 then
+			label(body, 12, THEME.textSecondary, FONT.regular, {
+				Position = UDim2.fromOffset(44, 36),
+				Size = UDim2.new(1, -60, 0, lines * 16),
+				TextWrapped = true,
+				TextYAlignment = Enum.TextYAlignment.Top,
+				Parent = card,
+			})
+		end
+		local toast: { [string]: any } = { card = card, stroke = stroke, height = height, x = 0 }
+		local close = Widgets.button({
+			AnchorPoint = Vector2.new(1, 0),
+			Position = UDim2.new(1, -10, 0, 12),
+			Size = UDim2.fromOffset(22, 22),
+			Text = "×",
+			TextSize = 16,
+			FontFace = FONT.medium,
+			TextColor3 = THEME.textTertiary,
+			Parent = card,
+		})
+		close.MouseEnter:Connect(function()
+			close.TextColor3 = THEME.text
+		end)
+		close.MouseLeave:Connect(function()
+			close.TextColor3 = THEME.textTertiary
+		end)
+		close.Activated:Connect(function()
+			dismiss(toast)
+		end)
+		if #actions > 0 then
+			local specs = {}
+			for index, action in actions do
+				specs[index] = { action.text, index == #actions and "primary" or "outline", nil, function()
+					dismiss(toast)
+					action.onSelect()
+				end }
+			end
+			local bar = Widgets.actionBar(card, height - 14 - 28, specs)
+			bar.Position = UDim2.fromOffset(44, height - 14 - 28)
+			bar.Size = UDim2.new(1, -58, 0, 28)
+		end
+
+		toast.slide = Motion.spring(24, 4, 0.7, function(value)
+			card.Position = UDim2.fromOffset(toast.x + value, toast.y and toast.y.value or 0)
+		end)
+		toast.y = Motion.spring(0, 4, 0.8, function(value)
+			card.Position = UDim2.fromOffset(toast.x + toast.slide.value, value)
+		end)
+		table.insert(toasts, toast)
+		-- The new toast starts where it belongs (sliding in from the side);
+		-- the older ones move up to make room.
+		restack()
+		toast.y:snap(toast.y.target)
+		toast.slide:to(0)
+		tween(card, 0.18, { GroupTransparency = 0 })
+		tween(stroke, 0.18, { Transparency = 0 })
+
+		-- Leave after a while, unless the pointer is resting on it.
+		local hovered = false
+		card.MouseEnter:Connect(function()
+			hovered = true
+		end)
+		card.MouseLeave:Connect(function()
+			hovered = false
+		end)
+		task.spawn(function()
+			local remaining = spec.duration or 7
+			while remaining > 0 and not toast.gone do
+				task.wait(0.25)
+				if not hovered then
+					remaining -= 0.25
+				end
+			end
+			dismiss(toast)
+		end)
+		while #toasts > 4 do
+			dismiss(toasts[1])
+		end
+		return toast
+	end
+
+	---- Tooltips ---------------------------------------------------------------
+
+	local TIP_WIDTH = 260
+	local tip: { [string]: any } = { owner = nil, token = 0 }
+
+	local function tipFrame()
+		if tip.frame and tip.frame.Parent then
+			return tip.frame
+		end
+		tip.frame = create("TextLabel", {
+			Name = "Tooltip",
+			BackgroundColor3 = THEME.text,
+			BackgroundTransparency = 1,
+			TextColor3 = THEME.surface,
+			TextTransparency = 1,
+			TextSize = 12,
+			FontFace = FONT.medium,
+			TextWrapped = true,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			TextYAlignment = Enum.TextYAlignment.Top,
+			LineHeight = 1.1,
+			ZIndex = 50,
+			Parent = UI.layer,
+		}, {
+			corner(RADIUS.control),
+			create("UIPadding", {
+				PaddingLeft = UDim.new(0, 9),
+				PaddingRight = UDim.new(0, 9),
+				PaddingTop = UDim.new(0, 6),
+				PaddingBottom = UDim.new(0, 6),
+			}),
+		})
+		return tip.frame
+	end
+
+	local function hideTip()
+		tip.owner = nil
+		tip.token += 1
+		if tip.frame and tip.frame.Parent then
+			tween(tip.frame, 0.08, { BackgroundTransparency = 1, TextTransparency = 1 })
+		end
+	end
+	UI.hideTip = hideTip
+
+	local function showTip(object, text)
+		local frame = tipFrame()
+		local ok, bounds = pcall(TextService.GetTextSize, TextService, text, 12, Enum.Font.GothamMedium, Vector2.new(TIP_WIDTH - 18, 1000))
+		local size = ok and bounds or Vector2.new(TIP_WIDTH - 18, 48)
+		local width, height = math.ceil(size.X) + 20, math.ceil(size.Y * 1.1) + 14
+		local camera = Workspace.CurrentCamera
+		local viewport = camera and camera.ViewportSize or Vector2.new(1280, 720)
+		local position, objectSize = object.AbsolutePosition, object.AbsoluteSize
+		local x = math.clamp(position.X + objectSize.X / 2 - width / 2, 8, viewport.X - width - 8)
+		local y = position.Y - height - 8
+		if y < GuiService:GetGuiInset().Y + 4 then
+			y = position.Y + objectSize.Y + 8
+		end
+		frame.Text = text
+		frame.Size = UDim2.fromOffset(width, height)
+		frame.Position = UDim2.fromOffset(x, y)
+		tween(frame, 0.1, { BackgroundTransparency = 0, TextTransparency = 0 })
+	end
+
+	function UI.tip(object, text)
+		object.MouseEnter:Connect(function()
+			tip.owner = object
+			tip.token += 1
+			local token = tip.token
+			task.delay(0.35, function()
+				if tip.token == token and tip.owner == object and object.Parent then
+					local value = type(text) == "function" and text() or text
+					if value and value ~= "" then
+						showTip(object, value)
+					end
+				end
+			end)
+		end)
+		object.MouseLeave:Connect(function()
+			if tip.owner == object then
+				hideTip()
+			end
+		end)
+	end
+
+	Notify.show = function(spec)
+		UI.toast(spec)
+	end
+end
+
 -- Build every instance of the interface. Called at boot, and again by
 -- UI.rebuild when the theme or the dock's edge changes.
 function UI.construct()
@@ -14200,6 +15270,12 @@ function UI.construct()
 	UI.syncChrome()
 	CollectionService:AddTag(UI.gui, OWNED_TAG)
 	UI.gui.Parent = playerGui
+	-- Notifications that arrived before the interface did.
+	local waiting = table.clone(Notify.queue)
+	table.clear(Notify.queue)
+	for _, spec in waiting do
+		UI.toast(spec)
+	end
 end
 
 -- Tear the interface down and build it again in the same state: the same
@@ -14218,6 +15294,7 @@ function UI.rebuild()
 	UI.drag = nil
 	UI.intro = nil
 	UI.fromIntro = nil
+	UI.clearToasts()
 	if UI.gui then
 		UI.gui:Destroy()
 	end
@@ -14240,9 +15317,9 @@ function UI.rebuild()
 		local geo = UI.geo
 		local camera = Workspace.CurrentCamera
 		local viewport = camera and camera.ViewportSize or Vector2.new(1280, 720)
-		local vertical = SIDES[UI.sideName()].vertical
-		geo.thick:snap(vertical and LAYOUT.panelWidth or math.min(LAYOUT.panelHeight, viewport.Y - 48 - GuiService:GetGuiInset().Y))
-		geo.long:snap(vertical and math.min(LAYOUT.panelHeight, viewport.Y - 48) or math.max(LAYOUT.panelWidth - LAYOUT.dockWidth, UI.dockRest + LAYOUT.dockPadding * 2))
+		local panelThick, panelLong = UI.panelSize(viewport)
+		geo.thick:snap(panelThick)
+		geo.long:snap(panelLong)
 		geo.radius:snap(RADIUS.shell)
 		geo.hide:snap(0)
 		UI.shown = true
