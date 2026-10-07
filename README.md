@@ -48,6 +48,33 @@ To build a model you can drop into any place (or publish to the Creator Store):
 rojo build model.project.json -o Solstice.rbxm
 ```
 
+### Executor build
+
+[`SolsticeShaders.exploit.luau`](SolsticeShaders.exploit.luau) is a standalone
+edition for executor environments. It is the same client-side cosmetic shader
+pack — it only renders, it reads no game state and touches no other players —
+repackaged so it loads from an executor instead of from a LocalScript:
+
+- **Load it** with `loadstring(game:HttpGet("<raw url>"))()`, or paste the
+  whole file into the executor and run it. Running it again hot-reloads: the
+  previous copy unloads itself (restoring the place's lighting) first.
+- **Configs save to file.** Settings are stored as JSON in the executor's
+  workspace folder (`Solstice/` by default) instead of on a player attribute.
+  A **Configs** icon in the dock opens a panel where you name and **Save** the
+  current look, then **Load** or **Delete** saved configs later. The last one
+  you saved or loaded comes back automatically on launch.
+- **Console API.** `getgenv().SolsticeShaders` exposes `saveConfig(name)`,
+  `loadConfig(name)`, `deleteConfig(name)`, `listConfigs()` and `unload()`.
+- It parents its interface through `gethui()` / `CoreGui` when available so a
+  respawn or a GUI-resetting game does not take it down, and falls back to
+  `PlayerGui` otherwise. When the executor exposes no file API, configs cannot
+  be saved to disk and the Configs panel says so; the shaders still run and
+  settings persist for the session.
+
+The `CONFIG` block near the top adds `ConfigFolder` (where the files live) and
+`AutoLoadLastConfig` (load the last config on launch) on top of the options
+below.
+
 ## Using it
 
 - **Open the dock:** move the pointer to the middle of the right-hand screen
@@ -132,8 +159,9 @@ deletes something Solstice made, it rebuilds itself.
 
 ```
 SolsticeShaders.client.luau   the whole shader pack (one LocalScript)
-default.project.json          Rojo project: syncs it to StarterPlayerScripts
-model.project.json            Rojo project: builds it as a standalone model
+SolsticeShaders.exploit.luau  the executor build (file-saved configs + UI)
+default.project.json          Rojo project: syncs the LocalScript to StarterPlayerScripts
+model.project.json            Rojo project: builds the LocalScript as a standalone model
 ```
 
 The script is split into numbered sections. Search for the banners
