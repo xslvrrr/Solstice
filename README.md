@@ -14,10 +14,10 @@ governor.
 
 | Tab | What it covers |
 | --- | --- |
-| **Atmosphere** | Time-of-day light colour, dynamic or fixed clock, day/night cycle, atmospheric fog (with a tint colour) and distance haze, light shafts, morning mist, cave fog, volumetric clouds and cloud shadows, fading stars, the Milky Way, shooting stars and meteor showers in any colour, and a full-sky aurora with five palettes or your own gradient |
-| **World** | Clear, rain, storm and snow weather, lightning with visible forked bolts, rainbows as the rain clears, rain that keeps falling outside while you shelter, wet glossy surfaces, puddles with raindrop ripples, ground splashes, snow cover on terrain, fireflies and dust motes, indoor dust caught by the light, seasonal grass tints, and a custom sun path |
-| **Materials** | Sky reflections and ambient, a sheen for every material that goes all the way to a mirror, shadows from local lights (Future), light intensity, flicker and warmth, light halos and contact shadows for Voxel and ShadowMap, terrain water styles or a custom water colour, and an underwater shader (fog, lens warp, bubbles, muffled audio) |
-| **Camera** | Bloom, lens flare, motion blur, depth of field with adaptive autofocus, auto exposure, tone mapping, Lightroom-style grading (exposure, contrast, highlights, shadows, whites, blacks, clarity, dehaze, vibrance, saturation, white balance, three colour-picker wheels) with 16 presets, a Lightroom-style HSL colour mixer, vignette, film grain, lens droplets and a speed FOV kick |
+| **Atmosphere** | Dynamic time-of-day lighting with sun strength and night brightness, time-of-day colour, realistic (Future) lighting on request, dynamic or fixed clock, a custom atmosphere (fog, haze, sun glare, fog tint, morning mist, cave fog), light shafts, custom clouds (cover, thickness, tint, cloud shadows), custom stars, the Milky Way, shooting stars and meteor showers in any colour, and a full-sky aurora with five palettes or your own gradient |
+| **World** | Clear, rain, storm and snow weather, wind, lightning with visible forked bolts, rainbows after rain or always, rain that keeps falling outside while you shelter, wet glossy surfaces, puddles (size, shine) with raindrop ripples, ground splashes, snow cover on terrain, fireflies and dust motes, indoor dust caught by the light, seasonal grass tints, a custom sun path and shadow softness |
+| **Materials** | Custom sky reflections and ambient, a sheen for every material that goes all the way to a mirror, **real reflections** of avatars in puddles, shiny floors and mirrors, reflective avatars, shadows from local lights (Future), light intensity, flicker and warmth, light halos and contact shadows for Voxel and ShadowMap, terrain water styles or a custom water colour, and an underwater shader (fog, lens warp, bubbles, muffled audio) |
+| **Camera** | Bloom, lens flare, motion blur, replacing the game's own effects, depth of field with adaptive autofocus, auto exposure, tone mapping, Lightroom-style grading (exposure, contrast, highlights, shadows, whites, blacks, clarity, dehaze, vibrance, saturation, white balance, three colour-picker wheels) with 16 presets, a Lightroom-style HSL colour mixer with hue rings, vignette, film grain, lens droplets and a speed FOV kick |
 | **Fun** | Filters (Noir, Sepia, Dream, Vapor, Night vision, Frostbite, Inferno), hue cycle, tilt-shift, cinematic bars, camera wobble, crosshairs in any colour, time-lapse and sun/moon size |
 
 ## Installation
@@ -94,19 +94,46 @@ below.
 Settings survive respawns and script restarts during a session. They're
 stored on an attribute of the local player.
 
-### Vanilla to all out
+### From vanilla to anything
 
-The **Look** slider in the panel footer sets how much Solstice changes:
+Every setting starts at a value that leaves the place exactly as Roblox
+renders it. Solstice runs but touches nothing until you change something, so
+the base config makes no difference. That includes the place's own Atmosphere,
+Sky and Clouds, its wind, its post effects and its lighting style: each is
+only taken over while a setting asks for it, and handed straight back after.
 
-- **Vanilla** (far left, the default): the place exactly as Roblox renders it.
-  The engine doesn't run at all, so the base config makes no difference.
-- **Your look** (the tick in the middle): what your settings describe.
-  Between Vanilla and here, every value Solstice writes is blended from the
-  place's own value towards yours, so the look fades in smoothly.
-- **All out** (far right): past the middle, the look settings (fog, haze,
-  shafts, bloom, sheen, stars, aurora, grade punch and so on) are pushed
-  towards their strongest. They're never lowered, and the rows still show what
-  you set. Performance tiers aren't touched; pair it with the Ultra profile.
+From there each feature goes as far as you like; most ranges run well past
+what looks natural. The **Look** buttons in the panel footer are starting
+points that set real values:
+
+- **Vanilla:** every default, the place untouched (what **Reset** does too).
+- **Natural:** the balanced shader-pack look.
+- **Vivid:** halfway between Natural and All out, at Natural's cost.
+- **All out:** every look setting at its strongest, features at high quality.
+
+Change anything afterwards and the highlight clears: the settings are yours.
+Profiles (Low to Ultra) only change the quality of features that are on; they
+never switch a feature on.
+
+### Reflections
+
+*Materials → Sheen* is Part.Reflectance: every material reflects the sky, up
+to a perfect mirror. *Materials → Mirrors → Real reflections* is the other
+kind: real reflections of the players around you.
+
+- **Puddles:** rain puddles mirror whoever walks past.
+- **Floors:** also the shiny floor under you (glass, marble, metal, ice,
+  tiles, anything with Reflectance, or any floor while it rains).
+- **All:** also mirrors and foil on the walls nearby.
+
+Roblox can only draw a scene twice through a ViewportFrame, so each surface
+gets a ViewportFrame on a SurfaceGui holding mirrored copies of nearby avatars,
+with a camera aimed so each reflected point lands where your eye's ray meets
+the surface. It is drawn on the surface itself, so anything in front of it
+hides it. Only avatars are reflected (copying the whole world into every
+mirror would cost far too much). Distortion makes the image drift like
+water, and height fade fades bodies as they rise from the surface.
+*Reflective avatars* separately gives players' bodies a sky sheen.
 
 ### Colours
 
@@ -120,11 +147,25 @@ result as a preset. Recent colours and saved gradients last the session in the
 LocalScript and survive rejoins in the executor build.
 
 *Camera → Mixer* works like Lightroom's HSL panel: eight colour bands, each
-with a hue shift, saturation and luminance. Roblox has no per-pixel hue
-remapping, so the mixer recolours the scene itself: the light, fog, clouds,
-water, lamps and terrain, and (with *Recolour parts* on) parts around you.
-Textures and decals keep their colours. Every original is recorded and put
-back when you reset the mixer or switch off.
+with a hue ring (drag round it to choose what that colour becomes),
+saturation and luminance.
+
+Roblox's only colour post effect is one global tint, saturation and contrast,
+so no script can pick out "just the reds" on screen. The mixer therefore runs
+as a fitted post effect:
+
+1. A grid of rays samples the colours actually in view.
+2. Each sample goes through the exact per-colour mix.
+3. The global colour balance and saturation that best reproduce the result
+   become a grading layer.
+
+Change a colour that fills the screen and the image follows; change one that
+barely appears and it barely moves. *Mixer strength* scales it.
+
+*Also recolour the world* applies the exact mix to the scene as well: the
+light, fog, clouds, water, lamps, terrain and nearby parts. This is exactly
+per colour, but it changes those instances. Every original is recorded and put
+back.
 
 ### Performance
 
@@ -148,9 +189,9 @@ pipelines. They don't silently do nothing. On Voxel and ShadowMap, *Materials �
 Voxel* recreates two Future looks: halos around lamps and contact shadows under
 characters.
 
-By default the script asks the engine for the Realistic (Future) lighting
-style when the place isn't already using it. It puts the place's own style
-back when it stops. Set `RequestRealisticLighting = false` to turn this off.
+*Atmosphere → Light → Realistic lighting* asks the engine for the Realistic
+(Future) lighting style when the place isn't already using it, and puts the
+place's own style back when you switch it off.
 
 ## Configuration
 
@@ -160,10 +201,8 @@ a developer is most likely to change:
 | Option | Default | Purpose |
 | --- | --- | --- |
 | `StartEnabled` | `true` | Start with the shaders on. |
-| `DefaultLook` | `0` | Where the Look slider starts (and where Reset puts it): `0` is Vanilla, `0.5` your look, `1` all out. Set `0.5` if players should see the shaders without touching the slider. |
+| `StartLook` | `1` | The Look preset a player starts with before they have settings of their own: `1` Vanilla, `2` Natural, `3` Vivid, `4` All out. Set `2` if players should see the shaders without opening the panel. |
 | `ToggleKey` | `Enum.KeyCode.F6` | Key that opens and closes the panel. |
-| `SuppressGameEffects` | `true` | Switch off the place's own post effects (Bloom, ColorCorrection, …) while Solstice runs, so they don't stack with its own. They're switched back on afterwards. |
-| `RequestRealisticLighting` | `true` | Ask for the Realistic (Future) lighting style, as described above. |
 | `MinQualityForFuture` | `4` | Graphics quality level below which Future-only rows are locked. |
 | `AdaptiveTargetFps` | `50` | Frame rate the Adaptive governor tries to hold. |
 | `LoadBudget` | `48` | Sum of load scores that fills the load meter. |
@@ -183,10 +222,13 @@ row is locked.
 ## Leaves no trace
 
 Solstice either creates what it touches (and destroys it when switched off) or
-records the original value first and puts it back afterwards. That covers
+records the original value first and puts it back afterwards (the moment the
+setting that needed it is switched off, not only when the shaders stop). That
+covers
 Lighting properties, the clock, terrain water and material colours, the
-place's Atmosphere, Sky and Clouds, light shadows, brightness and colour, part
-reflectance and colour, ambient reverb and the camera's field of view. The records are
+place's Atmosphere, Sky and Clouds, its wind, lighting style and post effects,
+light shadows, brightness and colour, part and avatar reflectance, part colour,
+ambient reverb and the camera's field of view. The records are
 also stored on the instances themselves. If a copy of the script dies without
 cleaning up, the next copy restores the place before it starts. If the game
 deletes something Solstice made, it rebuilds itself.
