@@ -16,7 +16,7 @@ governor.
 | --- | --- |
 | **Atmosphere** | Dynamic time-of-day lighting with sun strength and night brightness, time-of-day colour, realistic (Future) lighting on request, dynamic or fixed clock, a custom atmosphere (fog, haze, sun glare, fog tint, morning mist, cave fog), light shafts, custom clouds (cover, thickness, tint, cloud shadows), custom stars, the Milky Way, shooting stars and meteor showers in any colour, and a full-sky aurora with five palettes or your own gradient |
 | **World** | Clear, rain, storm and snow weather, wind, lightning with visible forked bolts, rainbows after rain or always, rain that keeps falling outside while you shelter, wet glossy surfaces, puddles (size, shine) with raindrop ripples, ground splashes, snow cover on terrain, fireflies and dust motes, indoor dust caught by the light, seasonal grass tints, a custom sun path and shadow softness |
-| **Materials** | Custom sky reflections and ambient, a sheen for every material that goes all the way to a mirror, **real reflections** of avatars in puddles, shiny floors and mirrors, reflective avatars, shadows from local lights (Future), light intensity, flicker and warmth, light halos and contact shadows for Voxel and ShadowMap, terrain water styles or a custom water colour, and an underwater shader (fog, lens warp, bubbles, muffled audio) |
+| **Materials** | Custom sky reflections and ambient, a sheen for every material that goes all the way to a mirror, **real reflections** of the world and players in puddles, floors, mirrors and glass, chrome avatars that mirror the players and buildings around them, shadows from local lights (Future), light intensity, flicker and warmth, light halos and contact shadows for Voxel and ShadowMap, terrain water styles or a custom water colour, and an underwater shader (fog, lens warp, bubbles, muffled audio) |
 | **Camera** | Bloom, lens flare, motion blur, replacing the game's own effects, depth of field with adaptive autofocus, auto exposure, tone mapping, Lightroom-style grading (exposure, contrast, highlights, shadows, whites, blacks, clarity, dehaze, vibrance, saturation, white balance, three colour-picker wheels) with 16 presets, a Lightroom-style HSL colour mixer with hue rings, vignette, film grain, lens droplets and a speed FOV kick |
 | **Fun** | Filters (Noir, Sepia, Dream, Vapor, Night vision, Frostbite, Inferno), hue cycle, tilt-shift, cinematic bars, camera wobble, crosshairs in any colour, time-lapse and sun/moon size |
 
@@ -103,37 +103,34 @@ Sky and Clouds, its wind, its post effects and its lighting style: each is
 only taken over while a setting asks for it, and handed straight back after.
 
 From there each feature goes as far as you like; most ranges run well past
-what looks natural. The **Look** buttons in the panel footer are starting
-points that set real values:
-
-- **Vanilla:** every default, the place untouched (what **Reset** does too).
-- **Natural:** the balanced shader-pack look.
-- **Vivid:** halfway between Natural and All out, at Natural's cost.
-- **All out:** every look setting at its strongest, features at high quality.
-
-Change anything afterwards and the highlight clears: the settings are yours.
-Profiles (Low to Ultra) only change the quality of features that are on; they
-never switch a feature on.
+what looks natural. **Reset** in the panel footer puts everything back to
+vanilla.
 
 ### Reflections
 
 *Materials → Sheen* is Part.Reflectance: every material reflects the sky, up
 to a perfect mirror. *Materials → Mirrors → Real reflections* is the other
-kind: real reflections of the players around you.
+kind: real reflections of the structures and players around you.
 
-- **Puddles:** rain puddles mirror whoever walks past.
-- **Floors:** also the shiny floor under you (glass, marble, metal, ice,
-  tiles, anything with Reflectance, or any floor while it rains).
-- **All:** also mirrors and foil on the walls nearby.
+- **Puddles:** rain puddles reflect what is around and above them.
+- **Floors:** also the floor you stand on, as glossy as its material (glass,
+  marble and tiles strongly, plain plastic and wood a little, grass and sand
+  not at all), its Reflectance and the rain make it. *Floor gloss* scales it.
+- **All:** also mirrors, foil and glass nearby.
 
-Roblox can only draw a scene twice through a ViewportFrame, so each surface
-gets a ViewportFrame on a SurfaceGui holding mirrored copies of nearby avatars,
-with a camera aimed so each reflected point lands where your eye's ray meets
-the surface. It is drawn on the surface itself, so anything in front of it
-hides it. Only avatars are reflected (copying the whole world into every
-mirror would cost far too much). Distortion makes the image drift like
-water, and height fade fades bodies as they rise from the surface.
-*Reflective avatars* separately gives players' bodies a sky sheen.
+*Chrome avatars* (You or Everyone) turns bodies into mirrors: their largest
+parts reflect the players and nearest buildings around them, with an optional
+sky sheen on top. A reflection never contains another reflection.
+
+How it works: Roblox can only draw a scene twice through a ViewportFrame, so
+each surface gets a ViewportFrame on a SurfaceGui holding mirrored copies of
+the nearby structures (the most important first, up to *Reflected detail*) and
+players, with a camera aimed so each reflected point lands where your eye's
+ray meets the surface. Because it is drawn on the surface itself, anything in
+front of it hides it. A floor reflects a long band ahead of you, about three
+camera-heights wide (a camera's lens cannot open wider than 120 degrees across).
+Terrain, particles and effects are not reflected. Distortion makes the image
+drift like water; height fade fades things as they rise from the surface.
 
 ### Colours
 
@@ -173,7 +170,6 @@ Settings that cost real frame time are *tiers* (Off / Low / … / Ultra). Each
 tier has a load score from 0 to 4, shown as coloured pips next to the setting.
 The scores add up to the **load meter** in the panel header.
 
-- **Profiles:** Low, Med, High and Ultra in the footer set every tier at once.
 - **Adaptive:** when this is on, the governor watches your frame rate. If it
   drops below the target, the governor lowers tiers a step at a time (it never
   turns them off). It raises them again once there's headroom. While it's
@@ -201,7 +197,6 @@ a developer is most likely to change:
 | Option | Default | Purpose |
 | --- | --- | --- |
 | `StartEnabled` | `true` | Start with the shaders on. |
-| `StartLook` | `1` | The Look preset a player starts with before they have settings of their own: `1` Vanilla, `2` Natural, `3` Vivid, `4` All out. Set `2` if players should see the shaders without opening the panel. |
 | `ToggleKey` | `Enum.KeyCode.F6` | Key that opens and closes the panel. |
 | `MinQualityForFuture` | `4` | Graphics quality level below which Future-only rows are locked. |
 | `AdaptiveTargetFps` | `50` | Frame rate the Adaptive governor tries to hold. |
