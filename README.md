@@ -15,12 +15,12 @@ performance tiers and an adaptive quality governor.
 | Tab | What it covers |
 | --- | --- |
 | **Atmosphere** | Dynamic time-of-day lighting with sun strength and night brightness, time-of-day colour, realistic (Future) lighting on request, dynamic or fixed clock, a custom atmosphere (fog, haze, sun glare, fog tint, morning mist, cave fog), light shafts, custom clouds (cover, thickness, tint, cloud shadows), custom stars, the Milky Way, shooting stars and meteor showers in any colour, and a full-sky aurora (crisp flickering rays over a soft curtain glow) with five palettes or your own gradient |
-| **World** | Clear, rain, storm and snow weather, weather rotation with your own frequency and chances, wind, lightning with visible forked bolts, rainbows after rain or always, rain that keeps falling outside while you shelter, wet glossy surfaces, puddles (size, shine) with raindrop ripples, ground splashes, snow cover on terrain, fireflies and dust motes, indoor dust caught by the light, seasonal grass tints, a custom sun path and shadow softness |
-| **Materials** | Custom sky reflections and ambient, a sheen for every material that goes all the way to a mirror, **real reflections** of the world and players in puddles, floors, mirrors and glass, chrome avatars (a mirror layer over every body part and accessory, reflecting the players and buildings around them), shadows from local lights, light intensity, flicker and warmth, **Future lights** (a flashlight or lantern, glowing neon, lightning that lights the world and throws shadows, bounce light), light halos and contact shadows for Voxel and ShadowMap, terrain water styles or a custom water colour, and an underwater shader (fog, lens warp, bubbles, muffled audio) |
-| **Camera** | Bloom, lens flare, motion blur, replacing the game's own effects, depth of field with adaptive autofocus, auto exposure, tone mapping, Lightroom-style grading (exposure, contrast, highlights, shadows, whites, blacks, clarity, dehaze, vibrance, saturation, white balance, three colour wheels) with 16 presets, a Lightroom-style HSL colour mixer with smooth hue wheels and 15 LUTs, vignette, film grain, lens droplets and a speed FOV kick |
+| **World** | Clear, rain, storm and snow weather, weather rotation with your own frequency and chances, wind, lightning with visible forked bolts, rainbows after rain or always, rain that keeps falling outside while you shelter, wet glossy surfaces, puddles (in rain or always; size, shine) with raindrop ripples, ground splashes, snow cover on terrain, fireflies and dust motes, indoor dust caught by the light, seasonal grass tints, a custom sun path and shadow softness |
+| **Materials** | Custom sky reflections and ambient, a sheen for every material that goes all the way to a mirror, **real reflections** of the world and players in puddles and across every glossy floor in view, shadows from local lights, light intensity, flicker and warmth, **Future lights** (a flashlight or lantern, glowing neon, lightning that lights the world and throws shadows, bounce light), light halos and contact shadows for Voxel and ShadowMap, terrain water styles or a custom water colour, and an underwater shader (fog, lens warp, bubbles, muffled audio) |
+| **Camera** | Bloom, lens flare, motion blur, replacing the game's own effects, depth of field with adaptive autofocus, auto exposure, tone mapping, Lightroom-style grading (exposure, contrast, highlights, shadows, whites, blacks, clarity, dehaze, vibrance, saturation, white balance, three colour wheels) with 16 presets, a Lightroom-style HSL colour mixer (masked to the colours you move) with smooth hue wheels and 15 LUTs, vignette, film grain, lens droplets and a speed FOV kick |
 | **Fun** | Filters (Noir, Sepia, Dream, Vapor, Night vision, Frostbite, Inferno), a hue cycle through the rainbow or your own gradient, tilt-shift, cinematic bars, camera wobble, a replacement mouse cursor and shift-lock cursor, avatar effects (colour cycle through a gradient, reflectance, material, ghost, headless, Korblox legs) for you or everyone, time-lapse and sun/moon size |
 | **Configs** | Save the look under a name, then load, update, rename or delete it (each asks first); share a look as a code and import other people's; your recent colours and gradient presets |
-| **Settings** | The dock's edge (right, left, top or bottom), theme presets (Dark, Midnight, Graphite, Light, Paper), accent colour, UI tint, contrast, the panel key, adaptive quality and more |
+| **Settings** | The dock's edge (right, left, top or bottom), theme presets (Dark, Midnight, Graphite, Light, Paper), accent colour, UI tint, contrast, the panel key (press any key to bind it), adaptive quality and more |
 
 ## Installation
 
@@ -86,7 +86,9 @@ LocalScript:
   shown the panel key. Then the island folds itself into the dock.
 - **Open the dock:** move the pointer to the middle of the dock's screen edge
   (the right one by default), or press **F6**. The key also works in first
-  person, where the mouse is locked. On touch screens, tap the edge.
+  person, where the mouse is locked. To change it, click *Settings →
+  Behaviour → Panel key* and press the key you want (Escape keeps the old
+  one). On touch screens, tap the edge.
 - **Open a section:** click an icon and the dock stretches into a settings
   panel. The sub-tabs under the header switch between that section's parts,
   for example *Camera → Lens / Focus / Exposure / Grading / Mixer / Film*.
@@ -99,7 +101,11 @@ LocalScript:
   lighting.
 - **Right-click** a saved config or a gradient preset for more options.
 - **Hover** the coloured cost pips beside a setting, the load bar or the
-  lighting chip in the header to see what they mean.
+  lighting chip in the header, or the frame rate in the footer, to see what
+  they mean.
+- **Frame rate:** the bottom-left of the panel footer shows it, with a dot
+  that is green at your target frame rate, yellow a little under and red well
+  under.
 
 Settings survive respawns and script restarts during a session.
 
@@ -133,11 +139,11 @@ to load it.
 to a perfect mirror. *Materials → Mirrors → Real reflections* is the other
 kind: real reflections of the structures and players around you.
 
-- **Puddles:** rain puddles reflect what is around and above them.
-- **Floors:** also the glossy floors around and ahead of you, as glossy as
-  their material (glass, marble and tiles strongly, plain plastic and wood a
-  little, grass and sand not at all), their Reflectance and the rain make
-  them. *Floor gloss* scales it.
+- **Puddles:** puddles reflect what is around and above them.
+- **Floors:** also every glossy floor in view, as glossy as their material
+  (glass, marble and tiles strongly, plain plastic and wood a little, grass
+  and sand not at all), their Reflectance and the rain make them. *Floor
+  gloss* scales it.
 
 Floors are found by a fan of rays falling from points around and ahead of
 your character. The glossy surfaces they land on are grouped by height, so a
@@ -151,13 +157,9 @@ nothing.
 - **Further ones** become plain blocks of their size and colour.
 - **Small things** drop out first as they get further away.
 
-Higher detail keeps more, further out.
-
-*Chrome avatars* (You or Everyone) covers every body part and accessory with a
-mirror layer (*Chrome layer*), and the larger body parts also reflect the
-players and buildings around them (*Chrome reflections*). A reflection never
-contains another reflection. *Fun → Avatar → Reflectance* is the plain sky
-sheen on its own.
+Higher detail keeps more, further out, and lets floor reflections reach
+further (see below). A reflection never contains another reflection. *Fun →
+Avatar → Reflectance* is the plain sky sheen.
 
 How it works: Roblox can only draw a scene twice through a ViewportFrame, so
 each surface gets a ViewportFrame on a SurfaceGui holding mirrored copies of
@@ -166,9 +168,22 @@ players, with a camera aimed so each reflected point lands where your eye's
 ray meets the surface. A ViewportFrame only draws when its GUI lives under
 PlayerGui (or the core GUI), so the SurfaceGuis sit there and are shown on
 their surfaces through `Adornee`. Because a reflection is drawn on the surface
-itself, anything in front of it hides it. A floor reflects a long band ahead
-of you, about three camera-heights wide (a camera's lens can't open wider than
-120 degrees across). Terrain, particles and effects aren't reflected.
+itself, anything in front of it hides it. Terrain, particles and effects
+aren't reflected.
+
+One such camera can't cover a floor: its lens can't open wider than 120
+degrees, so across its narrow side it reaches only about 1.6 times your eye's
+height from the point below your eye. So a floor is drawn as a fan of wedges
+around that point, each with its own reflection, with its long reach running
+out along the wedge. Narrow wedges reach further, so Solstice picks the wedge
+count that reaches the *Reflection range* (within the detail budget). Only the
+wedges you can see are drawn, and each reflects only what lies in its
+direction. A gradient cuts each wedge exactly along its edge, so neighbours
+meet without a seam or overlap. The wedges are fixed to the world, so turning
+the camera just brings new ones in at the edges. Reflections fade out over the
+last part of the range rather than stopping at an edge. With the camera low
+(first person) the fan reaches about 50 studs at the default detail; from a
+normal third-person height it covers about 100.
 *Distortion* makes the reflection sway at two speeds, bends it slightly as if
 the surface weren't quite still, and drifts a soft ripple sheen across it.
 *Height fade* fades things as they rise from the surface.
@@ -203,23 +218,25 @@ orange, Autumn, Kodachrome, Cyberpunk, Matrix and more); editing any band
 afterwards turns it into Custom.
 
 Roblox's only colour post effect is one global tint, saturation and contrast,
-so no script can pick out "just the reds" on screen. The mixer therefore runs
-as a fitted post effect:
+so no script can pick out "just the reds" on screen. *Mixer works on* picks
+how the mix gets there:
 
-1. A grid of rays samples the colours actually in view.
-2. Each sample goes through the exact per-colour mix.
-3. The global colour balance and saturation that best reproduce the result
-   become a grading layer.
+- **Scene colours** (the default) masks it the only way Roblox allows: the
+  exact per-colour mix is applied to the scene's own colours (the light, fog,
+  clouds, water, lamps, terrain and nearby parts). Only the colours you moved
+  change; everything else on screen is left alone. Every original is recorded
+  and put back.
+- **Whole screen** is a fitted grading layer, which also reaches textures and
+  the skybox: a grid of rays samples the colours in view, each sample goes
+  through the exact mix, and the colour balance, saturation and exposure that
+  best reproduce the result become the layer. Each sample counts for the share
+  of the screen it stands for, so a colour that barely appears barely moves
+  the screen. The layer only multiplies (tint and exposure, never added
+  brightness, which lifts the blacks and flattens the image) and is bounded.
+- **Colours + screen** does both.
 
-The colours you change lead the fit: each sample counts by how much the mix
-moves it, so the rest of the screen barely holds it back. The layer is also
-driven harder than a plain fit. At *Mixer strength* 1x a change reads
-clearly, and at 2x it's as bold as an editor's sliders.
-
-*Also recolour the world* applies the exact mix to the scene as well: the
-light, fog, clouds, water, lamps, terrain and nearby parts. This is exactly
-per colour, but it changes those instances. Every original is recorded and put
-back.
+*Mixer strength* scales every band's shift: at 2x a shift keeps pushing past
+the slider's end, as bold as an editor's sliders.
 
 ### Cursor
 
@@ -259,7 +276,8 @@ looks: halos around lamps and contact shadows under characters.
 ### The interface
 
 *Settings → Layout → Position* puts the dock on any screen edge: right, left,
-top (below Roblox's top bar, and fully behind it when hidden) or bottom. The
+top (right at the top of the screen, level with Roblox's top-bar buttons) or
+bottom. The
 panel opens from it, and the reveal zone, magnification and tooltips follow.
 On the top and bottom edges the panel is wide and short, with its rows in two
 columns.
@@ -366,7 +384,7 @@ The rest of `CONFIG`:
 | --- | --- | --- |
 | `Storage` | `nil` | Where configs are kept (see below). |
 | `StartEnabled` | `true` | Start with the shaders on. |
-| `ToggleKey` | `Enum.KeyCode.F6` | The panel key players start with (they can pick another in Settings). |
+| `ToggleKey` | `Enum.KeyCode.F6` | The panel key players start with (they can bind any other in Settings). |
 | `PersistSettings` | `true` | Remember each player's settings across respawns. |
 | `MinQualityForFuture` | `4` | Graphics quality level below which Future-only rows are locked. |
 | `LoadBudget` | `48` | Sum of load scores that fills the load meter. |
@@ -376,7 +394,9 @@ The rest of `CONFIG`:
 
 The adaptive quality target and the panel's position, theme and key are
 player settings now (the Settings tab), so their defaults go in `Defaults`
-(`ui.targetFps`, `ui.side`, `ui.theme`, `ui.toggleKey`, ...).
+(`ui.targetFps`, `ui.side`, `ui.theme`, `ui.toggleKey`, ...). A key setting
+takes the key's name, such as `["ui.toggleKey"] = "RightShift"`, or an
+`Enum.KeyCode`.
 
 ### Keeping configs for good
 
